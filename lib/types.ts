@@ -8,9 +8,9 @@ export type RegionKind = "floor" | "wall";
 export interface DetectedRegion {
   id: string;
   kind: RegionKind;
-  /** One quad per detected plane (e.g. two for a wall spanning a real corner), each giving that
-   * plane its own correct perspective warp — all sharing the same mask/selection/design, so a
-   * corner never splits the region itself, only how its texture is warped on each side of it. */
+  /** Perspective quad(s) for this region's own plane. A wall spanning a real architectural
+   * corner is detected as separate regions, one per plane, each with its own mask, selection,
+   * and design, and a single quad here. */
   quads: Quad[];
   /** Where to place the selection hotspot, in source-image pixel space. */
   centroid: Point;
@@ -18,6 +18,7 @@ export interface DetectedRegion {
   maskData: Uint8Array;
   maskWidth: number;
   maskHeight: number;
+  meanIntensity: number;
 }
 
 export interface CatalogItem {

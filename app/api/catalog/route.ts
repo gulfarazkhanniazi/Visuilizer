@@ -8,10 +8,12 @@ import { CatalogItem, RegionKind } from "@/lib/types";
 export const revalidate = 300;
 
 const IMAGE_EXTENSIONS = new Set([".webp", ".jpg", ".jpeg", ".png"]);
-// Flooring is floor-only; tiles are commonly rated for both wall and floor installation.
+// Flooring is floor-only; tiles are commonly rated for both wall and floor installation;
+// wall panels mount to a vertical surface only, never a floor.
 const FOLDERS: { dir: string; applicableTo: RegionKind[] }[] = [
   { dir: "flooring", applicableTo: ["floor"] },
   { dir: "tiles", applicableTo: ["wall", "floor"] },
+  { dir: "wall-panels", applicableTo: ["wall"] },
 ];
 
 function toLabel(filename: string): string {

@@ -11,6 +11,7 @@ interface AnalyzeRegion {
   maskPng: string | null;
   maskWidth: number;
   maskHeight: number;
+  meanIntensity: number;
 }
 
 interface AnalyzeResponse {
@@ -39,7 +40,16 @@ async function toDetectedRegion(kind: "floor" | "wall", r: AnalyzeRegion): Promi
   const maskData = await decodeMaskPng(r.maskPng, r.maskWidth, r.maskHeight);
   const quads = r.quads.map((quad) => quad.map(([x, y]) => ({ x, y }))) as Quad[];
   const centroid: Point = { x: r.centroid[0], y: r.centroid[1] };
-  return { id: r.id, kind, quads, centroid, maskData, maskWidth: r.maskWidth, maskHeight: r.maskHeight };
+  return {
+    id: r.id,
+    kind,
+    quads,
+    centroid,
+    maskData,
+    maskWidth: r.maskWidth,
+    maskHeight: r.maskHeight,
+    meanIntensity: r.meanIntensity ?? 0.5,
+  };
 }
 
 export interface DetectionResult {

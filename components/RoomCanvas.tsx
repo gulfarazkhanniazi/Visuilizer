@@ -2,8 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { RoomCompositor, RenderRegion } from "@/lib/perspective";
-import { CatalogItem, DesignAssignment, DetectedRegion, RegionKind } from "@/lib/types";
-import { computeRepeat } from "@/lib/geometry";
+import { CatalogItem, DesignAssignment, DetectedRegion } from "@/lib/types";
+import { computeTileUv } from "@/lib/geometry";
 import { findCatalogItem } from "@/lib/catalog";
 import { loadImage } from "@/lib/imageCache";
 import { ErrorBanner } from "./ErrorBanner";
@@ -16,15 +16,18 @@ interface RoomCanvasProps {
   imgHeight: number;
   floorRegions: DetectedRegion[];
   wallRegions: DetectedRegion[];
-  activeKind: RegionKind;
-  onActiveKindChange: (kind: RegionKind) => void;
   selectedIds: Set<string>;
   onToggleSelect: (id: string) => void;
   onDeselectAll: () => void;
+  onSelectAllSurfaces: () => void;
+  onSelectAllFloor: () => void;
+  onSelectAllWall: () => void;
   assignments: DesignAssignment;
   catalog: CatalogItem[];
 }
 
+// The hotspot itself doubles as the surface checkbox — a black-bordered square with a visible
+// check icon when selected — so there's no separate Floor/Wall toggle to keep in sync with it.
 function Hotspot({
   x,
   y,
@@ -39,18 +42,23 @@ function Hotspot({
   return (
     <button
       type="button"
+      role="checkbox"
+      aria-checked={selected}
       onClick={onClick}
       style={{ left: `${x * 100}%`, top: `${y * 100}%` }}
-      className={`absolute flex h-9 w-9 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border-2 border-white shadow-lg transition-colors ${
-        selected ? "bg-zinc-900" : "bg-white/40 backdrop-blur-sm hover:bg-white/60"
+      className={`absolute flex h-9 w-9 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border-2 border-black shadow-lg transition-colors ${
+        selected ? "bg-black" : "bg-white/40 backdrop-blur-sm hover:bg-white/60"
       }`}
     >
       {selected && (
-        <svg viewBox="0 0 20 20" fill="white" className="h-4 w-4">
+        <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4">
           <path
-            fillRule="evenodd"
-            d="M16.704 5.29a1 1 0 0 1 0 1.415l-7.5 7.5a1 1 0 0 1-1.414 0l-3.5-3.5a1 1 0 1 1 1.414-1.414L8.5 12.086l6.79-6.796a1 1 0 0 1 1.414 0Z"
-            clipRule="evenodd"
+            d="M4.5 10.5l3.5 3.5 7.5-8.5"
+            stroke="currentColor"
+            strokeWidth="2.3"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className="text-white"
           />
         </svg>
       )}
@@ -64,11 +72,12 @@ export function RoomCanvas({
   imgHeight,
   floorRegions,
   wallRegions,
-  activeKind,
-  onActiveKindChange,
   selectedIds,
   onToggleSelect,
   onDeselectAll,
+  onSelectAllSurfaces,
+  onSelectAllFloor,
+  onSelectAllWall,
   assignments,
   catalog,
 }: RoomCanvasProps) {
@@ -79,7 +88,9 @@ export function RoomCanvas({
   const [renderError, setRenderError] = useState<string | null>(null);
   const [showOriginal, setShowOriginal] = useState(false);
 
-  const activeRegions = activeKind === "floor" ? floorRegions : wallRegions;
+  // No separate surface toggle — every detected floor and wall part gets its own hotspot on the
+  // image at once, and tapping one is both "make it visible/selected" and the design target.
+  const activeRegions = [...floorRegions, ...wallRegions];
 
   useEffect(() => {
     if (!canvasRef.current) return;
@@ -145,8 +156,26 @@ export function RoomCanvas({
           // perspective orientation; all share this same mask, so a corner still never splits
           // the underlying selection/design, only how the texture is warped on each side of it.
           for (const quad of region.quads) {
-            const { repeatX, repeatY } = computeRepeat(quad, tile.w, tile.h, DENSITY[kind]);
-            regions.push({ quad, texture: tile.texture, maskTexture, repeatX, repeatY });
+            // `imgWidth` is the shared reference every quad's repeat count is anchored to, so a
+            // tile reads as the same real-world size on a small wall segment and a large one —
+            // see computeTileUv's own doc comment for why a per-quad-only density doesn't do that.
+            const { repeatX, repeatY, offsetX, offsetY } = computeTileUv(
+              quad,
+              tile.w,
+              tile.h,
+              DENSITY[kind],
+              imgWidth,
+            );
+            regions.push({
+              quad,
+              texture: tile.texture,
+              maskTexture,
+              repeatX,
+              repeatY,
+              offsetX,
+              offsetY,
+              meanIntensity: region.meanIntensity,
+            });
           }
         }
       }
@@ -177,39 +206,32 @@ export function RoomCanvas({
 
   return (
     <div className="relative">
-      <div className="mb-3 flex items-center justify-between gap-2">
-        <div className="flex gap-1 rounded-full bg-zinc-100 p-1 dark:bg-zinc-800">
+      <div className="mb-3 flex flex-wrap items-center justify-end gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
             disabled={floorRegions.length === 0}
-            onClick={() => onActiveKindChange("floor")}
-            className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
-              activeKind === "floor"
-                ? "bg-white text-zinc-900 shadow-sm dark:bg-zinc-950 dark:text-zinc-100"
-                : floorRegions.length === 0
-                  ? "cursor-not-allowed text-zinc-400 dark:text-zinc-600"
-                  : "text-zinc-600 hover:text-zinc-900 dark:text-zinc-300 dark:hover:text-zinc-100"
-            }`}
+            onClick={onSelectAllFloor}
+            className="rounded-full border border-zinc-200 bg-white px-3 py-1.5 text-xs font-medium text-zinc-700 transition-colors hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-40 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
           >
-            Floors
+            Select whole floor
           </button>
           <button
             type="button"
             disabled={wallRegions.length === 0}
-            onClick={() => onActiveKindChange("wall")}
-            className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
-              activeKind === "wall"
-                ? "bg-white text-zinc-900 shadow-sm dark:bg-zinc-950 dark:text-zinc-100"
-                : wallRegions.length === 0
-                  ? "cursor-not-allowed text-zinc-400 dark:text-zinc-600"
-                  : "text-zinc-600 hover:text-zinc-900 dark:text-zinc-300 dark:hover:text-zinc-100"
-            }`}
+            onClick={onSelectAllWall}
+            className="rounded-full border border-zinc-200 bg-white px-3 py-1.5 text-xs font-medium text-zinc-700 transition-colors hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-40 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
           >
-            Walls
+            Select whole wall
           </button>
-        </div>
-
-        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            disabled={floorRegions.length === 0 || wallRegions.length === 0}
+            onClick={onSelectAllSurfaces}
+            className="rounded-full border border-zinc-200 bg-white px-3 py-1.5 text-xs font-medium text-zinc-700 transition-colors hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-40 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
+          >
+            Select all surfaces
+          </button>
           <button
             type="button"
             onClick={() => setShowOriginal((v) => !v)}

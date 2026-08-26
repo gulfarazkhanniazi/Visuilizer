@@ -16,24 +16,43 @@ precision highp float;
 in vec2 vUnit;
 uniform sampler2D uTile;
 uniform sampler2D uMask;
+uniform sampler2D uRoom;
 uniform vec2 uRoomResolution;
 uniform vec2 uRepeat;
+uniform vec2 uOffset;
+uniform float uMeanIntensity;
+uniform float uShadingStrength;
 out vec4 outColor;
 void main() {
-  vec2 tileUv = vUnit * uRepeat;
+  vec2 tileUv = vUnit * uRepeat + uOffset;
   vec4 tileColor = texture(uTile, tileUv);
   vec2 roomUv = vec2(gl_FragCoord.x, uRoomResolution.y - gl_FragCoord.y) / uRoomResolution;
-  // The new design shows its true, unmodified color — no tinting/shading from whatever was
-  // there before, so it never reads as "mixed" with the previous wall/floor color.
-  // Only paint pixels the segmentation mask actually classified as this surface —
-  // keeps paintings, furniture, windows etc. sitting in front of the wall/floor untouched.
-  // Two adjacent wall sections are each their own draw call with their own mask texture; a
-  // soft/partial alpha here (even a narrow one) would leave both sections under-opaque right
-  // on the shared seam between them, showing a thin strip of the original photo through the
-  // gap. A hard discard makes the decision binary — exactly one side owns each pixel, so
-  // adjacent sections' designs always meet with zero gap between them.
-  if (texture(uMask, roomUv).r < 0.5) discard;
-  outColor = vec4(tileColor.rgb, tileColor.a);
+  // The mask itself is a soft alpha matte, not a binary in/out decision (see _guided_filter_alpha
+  // in the analysis service) — a boundary pixel is genuinely some fraction surface and some
+  // fraction not, so it's blended proportionally via alpha rather than snapped to fully-painted or
+  // fully-original. The discard here is purely a performance skip for texels that are essentially
+  // zero coverage, not a coverage decision — that decision already happened upstream, at the
+  // photo's true resolution, and shouldn't be re-made here at a coarser, aliased cutoff.
+  float coverage = texture(uMask, roomUv).r;
+  if (coverage < 0.02) discard;
+
+  // Extract shading from original photo
+  vec4 roomColor = texture(uRoom, roomUv);
+  float roomIntensity = dot(roomColor.rgb, vec3(0.299, 0.587, 0.114));
+
+  // local intensity relative to region's average intensity
+  float shading = roomIntensity / max(uMeanIntensity, 0.05);
+
+  // Keep shading within a narrow band: enough to read as a real highlight/shadow (and to keep an
+  // actual architectural corner visually distinct from the flat plane next to it) without letting
+  // a dark shadow or a blown-out window highlight crush the design toward black/white — that reads
+  // as "recolored by the original wall," not as a solid design lit naturally.
+  shading = clamp(shading, 0.75, 1.3);
+
+  // Apply shading strength blend
+  shading = mix(1.0, shading, uShadingStrength);
+
+  outColor = vec4(tileColor.rgb * shading, coverage);
 }
 `;
 
@@ -131,6 +150,9 @@ export interface RenderRegion {
   maskTexture: WebGLTexture;
   repeatX: number;
   repeatY: number;
+  offsetX: number;
+  offsetY: number;
+  meanIntensity: number;
 }
 
 export class RoomCompositor {
@@ -253,7 +275,10 @@ export class RoomCompositor {
 
     const homographyLoc = gl.getUniformLocation(this.regionProgram, "uHomography");
     const repeatLoc = gl.getUniformLocation(this.regionProgram, "uRepeat");
+    const offsetLoc = gl.getUniformLocation(this.regionProgram, "uOffset");
     const roomResLoc = gl.getUniformLocation(this.regionProgram, "uRoomResolution");
+    const meanIntensityLoc = gl.getUniformLocation(this.regionProgram, "uMeanIntensity");
+    const shadingStrengthLoc = gl.getUniformLocation(this.regionProgram, "uShadingStrength");
     gl.uniform2f(roomResLoc, this.canvas.width, this.canvas.height);
 
     for (const region of regions) {
@@ -261,10 +286,21 @@ export class RoomCompositor {
       const homography = unitSquareToQuadHomography(ndcQuad);
       gl.uniformMatrix3fv(homographyLoc, false, homography);
       gl.uniform2f(repeatLoc, region.repeatX, region.repeatY);
+      gl.uniform2f(offsetLoc, region.offsetX, region.offsetY);
+      gl.uniform1f(meanIntensityLoc, region.meanIntensity);
+      // A little natural light/shadow is kept (see the fragment shader's tightened clamp) so a
+      // real architectural corner still reads visually distinct — full solid-color flatness here
+      // would make an adjoining plane painted with the same design blend into one continuous
+      // surface, hiding the room's actual geometry.
+      gl.uniform1f(shadingStrengthLoc, 0.3);
 
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, region.texture);
       gl.uniform1i(gl.getUniformLocation(this.regionProgram, "uTile"), 0);
+
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, this.roomTexture);
+      gl.uniform1i(gl.getUniformLocation(this.regionProgram, "uRoom"), 1);
 
       gl.activeTexture(gl.TEXTURE2);
       gl.bindTexture(gl.TEXTURE_2D, region.maskTexture);

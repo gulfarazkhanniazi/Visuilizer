@@ -1,7 +1,7 @@
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile # pyright: ignore[reportMissingImports]
 from fastapi.middleware.cors import CORSMiddleware # pyright: ignore[reportMissingImports]
 
-from vision import analyze_image, get_segmenter
+from vision import analyze_image, get_depth_estimator, get_segmenter
 
 app = FastAPI(title="Room Visualizer Analysis Service")
 
@@ -15,8 +15,11 @@ app.add_middleware(
 
 @app.on_event("startup")
 def warm_model():
-    # Loads (and downloads, first run) the model at startup instead of on the first request.
+    # Loads (and downloads, first run) both models at startup instead of on the first request —
+    # otherwise whichever user's photo happens to be the first `/analyze` call pays that ~10s
+    # load cost live.
     get_segmenter()
+    get_depth_estimator()
 
 
 @app.get("/health")
@@ -29,6 +32,7 @@ async def analyze(
     file: UploadFile = File(...),
     target_width: int = Form(...),
     target_height: int = Form(...),
+    debug: bool = Form(False),
 ):
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Uploaded file must be an image.")
@@ -44,7 +48,7 @@ async def analyze(
         f.write(image_bytes)
 
     try:
-        result = analyze_image(image_bytes, target_width, target_height)
+        result = analyze_image(image_bytes, target_width, target_height, debug=debug)
     except Exception as exc:  # noqa: BLE001
         import traceback
 

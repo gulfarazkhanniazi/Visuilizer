@@ -30,7 +30,6 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [photo, setPhoto] = useState<Photo | null>(null);
   const [regions, setRegions] = useState<Regions>({ floor: [], wall: [] });
-  const [activeKind, setActiveKind] = useState<RegionKind>("wall");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [assignments, setAssignments] = useState<DesignAssignment>({});
   const [pendingFile, setPendingFile] = useState<File | null>(null);
@@ -80,7 +79,6 @@ export default function Home() {
 
       setPhoto({ url, image: fullImage, width, height });
       setRegions(result);
-      setActiveKind(result.wall.length > 0 ? "wall" : "floor");
       setSelectedIds(new Set());
       setAssignments({});
       setPhase("workspace");
@@ -119,6 +117,12 @@ export default function Home() {
 
   const deselectAll = () => setSelectedIds(new Set());
 
+  const selectAllSurfaces = () =>
+    setSelectedIds(new Set([...regions.floor, ...regions.wall].map((r) => r.id)));
+
+  const selectAllFloor = () => setSelectedIds(new Set(regions.floor.map((r) => r.id)));
+  const selectAllWall = () => setSelectedIds(new Set(regions.wall.map((r) => r.id)));
+
   const applyDesignToSelection = (catalogId: string) =>
     setAssignments((prev) => {
       const next = { ...prev };
@@ -126,13 +130,62 @@ export default function Home() {
       return next;
     });
 
-  const activeCatalog = useMemo(() => catalogByKind(catalog, activeKind), [catalog, activeKind]);
+  const applyDesignToIds = (ids: string[], catalogId: string) =>
+    setAssignments((prev) => {
+      const next = { ...prev };
+      for (const id of ids) next[id] = catalogId;
+      return next;
+    });
 
-  const selectedCommonDesign = useMemo(() => {
-    const ids = [...selectedIds].map((id) => assignments[id]);
-    if (ids.length === 0) return undefined;
-    return ids.every((v) => v === ids[0]) ? ids[0] : undefined;
-  }, [selectedIds, assignments]);
+  const floorIdSet = useMemo(() => new Set(regions.floor.map((r) => r.id)), [regions]);
+  const wallIdSet = useMemo(() => new Set(regions.wall.map((r) => r.id)), [regions]);
+
+  const selectedFloorIds = useMemo(() => [...selectedIds].filter((id) => floorIdSet.has(id)), [selectedIds, floorIdSet]);
+  const selectedWallIds = useMemo(() => [...selectedIds].filter((id) => wallIdSet.has(id)), [selectedIds, wallIdSet]);
+
+  // When the selection spans both floors and walls (e.g. via "Select all surfaces"), only
+  // designs valid for both kinds make sense to offer in the shared picker — anything floor-only
+  // or wall-only would silently do nothing on the other kind's regions if applied from there.
+  const selectedKinds = useMemo(() => {
+    const kinds = new Set<RegionKind>();
+    if (selectedFloorIds.length > 0) kinds.add("floor");
+    if (selectedWallIds.length > 0) kinds.add("wall");
+    return kinds;
+  }, [selectedFloorIds, selectedWallIds]);
+
+  const isMixedSelection = selectedKinds.size > 1;
+
+  const activeCatalog = useMemo(() => {
+    const kind = [...selectedKinds][0];
+    return kind ? catalogByKind(catalog, kind) : catalog;
+  }, [catalog, selectedKinds]);
+
+  // Split out for the mixed-selection case: a shared picker (designs rated for both, e.g. tile)
+  // applies to the whole selection, but each surface also gets its own picker underneath for
+  // designs that only make sense on it (flooring is floor-only) — picking one of those only
+  // reassigns that surface's regions, leaving whatever the shared picker set for the other alone.
+  const sharedCatalog = useMemo(
+    () => catalog.filter((item) => item.applicableTo.includes("floor") && item.applicableTo.includes("wall")),
+    [catalog],
+  );
+  const floorOnlyCatalog = useMemo(
+    () => catalog.filter((item) => item.applicableTo.includes("floor") && !item.applicableTo.includes("wall")),
+    [catalog],
+  );
+  const wallOnlyCatalog = useMemo(
+    () => catalog.filter((item) => item.applicableTo.includes("wall") && !item.applicableTo.includes("floor")),
+    [catalog],
+  );
+
+  const commonDesignFor = (ids: string[]) => {
+    const values = ids.map((id) => assignments[id]);
+    if (values.length === 0) return undefined;
+    return values.every((v) => v === values[0]) ? values[0] : undefined;
+  };
+
+  const selectedCommonDesign = useMemo(() => commonDesignFor([...selectedIds]), [selectedIds, assignments]);
+  const floorCommonDesign = useMemo(() => commonDesignFor(selectedFloorIds), [selectedFloorIds, assignments]);
+  const wallCommonDesign = useMemo(() => commonDesignFor(selectedWallIds), [selectedWallIds, assignments]);
 
   return (
     <div className="flex flex-1 flex-col bg-zinc-50 dark:bg-black">
@@ -193,20 +246,19 @@ export default function Home() {
                 imgHeight={photo.height}
                 floorRegions={regions.floor}
                 wallRegions={regions.wall}
-                activeKind={activeKind}
-                onActiveKindChange={(kind) => {
-                  setActiveKind(kind);
-                  setSelectedIds(new Set());
-                }}
                 selectedIds={selectedIds}
                 onToggleSelect={toggleSelect}
                 onDeselectAll={deselectAll}
+                onSelectAllSurfaces={selectAllSurfaces}
+                onSelectAllFloor={selectAllFloor}
+                onSelectAllWall={selectAllWall}
                 assignments={assignments}
                 catalog={catalog}
               />
               <p className="text-xs text-zinc-400">
-                Tap the highlighted areas to select which {activeKind === "wall" ? "wall" : "floor"}{" "}
-                sections to change, then pick a design.
+                Tap a highlighted checkbox on the photo to select that part — walls are split at
+                each detected corner, so you can give each side its own design. Use &ldquo;Select
+                whole floor/wall&rdquo; to apply one design across every part of a surface instead.
               </p>
             </div>
 
@@ -219,9 +271,34 @@ export default function Home() {
                 <div className="flex flex-1 items-center justify-center rounded-2xl border border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-400 dark:border-zinc-700">
                   Select one or more highlighted areas on the photo to choose a design for them.
                 </div>
+              ) : isMixedSelection ? (
+                <div className="flex flex-col gap-6">
+                  <DesignPicker
+                    title="Wall + floor design"
+                    items={sharedCatalog}
+                    selectedId={selectedCommonDesign}
+                    onSelect={applyDesignToSelection}
+                  />
+                  {floorOnlyCatalog.length > 0 && (
+                    <DesignPicker
+                      title="Floor only"
+                      items={floorOnlyCatalog}
+                      selectedId={floorCommonDesign}
+                      onSelect={(id) => applyDesignToIds(selectedFloorIds, id)}
+                    />
+                  )}
+                  {wallOnlyCatalog.length > 0 && (
+                    <DesignPicker
+                      title="Wall only"
+                      items={wallOnlyCatalog}
+                      selectedId={wallCommonDesign}
+                      onSelect={(id) => applyDesignToIds(selectedWallIds, id)}
+                    />
+                  )}
+                </div>
               ) : (
                 <DesignPicker
-                  title={`${activeKind === "wall" ? "Wall" : "Floor"} design`}
+                  title={`${[...selectedKinds][0] === "wall" ? "Wall" : "Floor"} design`}
                   items={activeCatalog}
                   selectedId={selectedCommonDesign}
                   onSelect={applyDesignToSelection}

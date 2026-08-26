@@ -1,7 +1,10 @@
 # Room Visualizer — analysis service
 
-Runs the real floor/wall detection (SegFormer semantic segmentation + OpenCV corner detection)
-server-side in Python. The Next.js app calls this directly from the browser.
+Runs the real floor/wall detection server-side in Python: SegFormer semantic segmentation,
+monocular depth estimation (Depth Anything V2), and an OpenCV/NumPy geometry pipeline (vanishing
+points, robust sub-pixel corner line fitting, shading/depth-based validation) that separates a
+wall into one independently selectable, independently designable region per real architectural
+corner. The Next.js app calls this directly from the browser.
 
 ## Setup (one-time)
 
@@ -18,8 +21,37 @@ cd python-service
 ./venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
-First startup downloads the model (~a few hundred MB, one-time, cached afterwards).
+First startup downloads both models (SegFormer + Depth Anything V2 Small, roughly a few hundred
+MB combined, one-time, cached afterwards). Uses CUDA or Apple Silicon (MPS) automatically when
+available, CPU otherwise.
 The Next.js app expects it at `http://localhost:8000` by default — override with
 `NEXT_PUBLIC_ANALYSIS_SERVICE_URL` if you run it elsewhere.
 
 Both this service and `npm run dev` need to be running for the app to work.
+
+## Regression check
+
+`tests/` guards against silently reintroducing a bug that was already found and fixed once —
+`tests/baseline.json` is a snapshot of the detection pipeline's own output (wall/floor area,
+region counts, object contamination) on every photo in `test-images/`. It is not a ground-truth
+accuracy benchmark (this project has no hand-labeled masks); it only proves a code change didn't
+unexpectedly move the pipeline's own numbers on photos already known to matter.
+
+Before considering a change to `vision.py` (or anything `lib/geometry.ts`/`lib/perspective.ts`
+depend on for mask shape) done:
+
+```bash
+./venv/bin/python tests/check_regression.py
+```
+
+Exits non-zero if anything regressed — object-contamination increases and large wall/floor area
+swings are hard failures; smaller shifts and region-count changes are printed as warnings. If a
+change is *meant* to move these numbers (a real, visually-verified accuracy fix), re-baseline:
+
+```bash
+./venv/bin/python tests/capture_baseline.py
+```
+
+only after confirming the new output by hand (check the debug overlays), the same way every fix
+in this project has been verified — this harness catches *unintended* drift, it doesn't replace
+looking at the actual masks.
