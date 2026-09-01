@@ -78,23 +78,24 @@ def _estimate_depth(image: Image.Image, size: tuple[int, int]) -> np.ndarray:
     return depth
 
 
-def _segment(image: Image.Image, segmenter, extra_prob_label: str = "floor") -> tuple[list[dict], np.ndarray]:
-    """Runs the model directly instead of going through the pipeline's own call, so we keep one
-    class's full per-pixel probability, not just which single class narrowly won. A pixel where
-    floor scores, say, 40% and some other class scores 45% is still very likely real floor — but
-    read through hard argmax alone (all the pipeline exposes) it becomes "not floor", and worse,
-    an object that then actively blocks growth from ever recovering it. Keeping that one class's
-    raw probability lets both the floor mask itself and what's allowed to block its growth stay
-    lenient exactly where the model is genuinely unsure, while staying just as strict everywhere
-    it isn't — this is what makes the per-pixel floor scan itself more accurate, not just the
-    cleanup applied after it.
+def _segment(
+    image: Image.Image, segmenter, extra_prob_labels: tuple[str, ...] = ("floor",)
+) -> tuple[list[dict], dict[str, np.ndarray]]:
+    """Runs the model directly instead of going through the pipeline's own call, so we keep each
+    requested class's full per-pixel probability, not just which single class narrowly won. A
+    pixel where floor scores, say, 40% and some other class scores 45% is still very likely real
+    floor — but read through hard argmax alone (all the pipeline exposes) it becomes "not floor",
+    and worse, an object that then actively blocks growth from ever recovering it. Keeping that
+    class's raw probability lets both the floor mask itself and what's allowed to block its growth
+    stay lenient exactly where the model is genuinely unsure, while staying just as strict
+    everywhere it isn't — this is what makes the per-pixel floor scan itself more accurate, not
+    just the cleanup applied after it.
 
-    Deliberately extracts only the argmax label map and this one class's probability *before*
+    Deliberately extracts only the argmax label map and these classes' probabilities *before*
     leaving the accelerator, rather than moving the model's full (~150-class, full-photo-resolution)
     probability tensor to CPU and reducing it there with numpy — on a large photo that full tensor
-    is well over a hundred times bigger than what's actually used afterward (this function's two
-    callers touch only the label map and one probability channel), and PyTorch's own argmax/index
-    on the accelerator is both the smaller transfer and the faster reduction.
+    is well over a hundred times bigger than what's actually used afterward, and PyTorch's own
+    argmax/index on the accelerator is both the smaller transfer and the faster reduction.
     """
     size = image.size # (w, h)
     inputs = segmenter.image_processor(images=image, return_tensors="pt")
@@ -105,8 +106,8 @@ def _segment(image: Image.Image, segmenter, extra_prob_label: str = "floor") -> 
     probs_t = resized.softmax(dim=1)[0] # (num_classes, H, W), still on the accelerator
     label_map = probs_t.argmax(dim=0).cpu().numpy()
 
-    extra_idx = next(idx for idx, lbl in segmenter.model.config.id2label.items() if lbl.strip() == extra_prob_label)
-    extra_prob = probs_t[extra_idx].cpu().numpy()
+    label2id = {lbl.strip(): idx for idx, lbl in segmenter.model.config.id2label.items()}
+    extra_probs = {lbl: probs_t[label2id[lbl]].cpu().numpy() for lbl in extra_prob_labels}
 
     outputs = []
     for idx, label in segmenter.model.config.id2label.items():
@@ -114,7 +115,7 @@ def _segment(image: Image.Image, segmenter, extra_prob_label: str = "floor") -> 
         if not mask.any():
             continue
         outputs.append({"label": label.strip(), "mask": mask})
-    return outputs, extra_prob
+    return outputs, extra_probs
 
 
 def _smooth_mask_contours(mask: np.ndarray, epsilon_frac: float = 0.004, max_epsilon: float = 5.0) -> np.ndarray:
@@ -948,7 +949,13 @@ def _detect_wall_corners(
     min_y, min_x, max_y, max_x = int(ys.min()), int(xs.min()), int(ys.max()), int(xs.max())
     width = max_x - min_x + 1
     height = max_y - min_y + 1
-    if width < 80 or height < 80:
+    # Lowered from 80: this same check (via the transpose in `_detect_horizontal_wall_corners`)
+    # was rejecting a real, evidenced molding strip above a narrow-but-real wall face (a nook's
+    # own return/side edge, 63px wide in one real test photo) before evidence-scoring ever got a
+    # chance to run — the 80px figure was sized for a *vertical* cluster's own realistic minimum,
+    # not for how narrow a still-genuinely-paintable wall face can legitimately be. 50 still rules
+    # out a sliver too thin to sample real bands from at all.
+    if width < 50 or height < 50:
         return []
 
     if max_corners is None:
@@ -1102,6 +1109,8 @@ def _detect_wall_corners(
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=20, minLineLength=min_line_length, maxLineGap=20)
 
     # This only needs to be as wide as `_row_diffs`/`_covered_run` actually require to sample real
+
+    # This only needs to be as wide as `_row_diffs`/`_covered_run` actually require to sample real
     # pixels on both sides of a candidate line (`row_diff_gutter` + `row_diff_band`) — not an
     # arbitrary cosmetic buffer. A flat 5%-of-width margin (the previous value) silently rejected
     # every real corner near a wall region's own left/right edge before it ever reached scoring —
@@ -1129,6 +1138,10 @@ def _detect_wall_corners(
     # close" judgment; that judgment now belongs entirely to `score()`, which already makes it
     # correctly per-candidate based on whatever real evidence actually exists there.
     edge_margin = max(3, round(width * 0.006))
+    if require_shading:
+        # After transpose, `width` is the wall's own height. A cut a few percent from the top or
+        # bottom is the ceiling or floor line, not an internal soffit/chair-rail.
+        edge_margin = max(edge_margin, round(width * 0.08))
     margin = edge_margin
     # A narrow real feature — a chimney breast, a shallow nook — can legitimately put two real
     # corners only 100-150px apart in the photo; the previous 0.6 multiplier assumed evenly
@@ -1143,6 +1156,11 @@ def _detect_wall_corners(
     # near-vertical, well-centered edge is already a strict geometric bar on its own — real
     # decorative lines (trim, a single picture edge) essentially never satisfy all four at once,
     # so meeting it is sufficient evidence by itself, no further gate needed.
+    # Horizontal architectural lines (soffits, chair rails) are often 10–18° off true horizontal
+    # because of camera perspective; the 10° bar used for vertical corners is too tight on this axis
+    # and was silently dropping real Hough evidence. Gradient-profile peaks on this axis are also
+    # mostly lighting falloff / ceiling lines, so those are skipped later when `require_shading`.
+    max_axis_angle = 18.0 if require_shading else 10.0
     hough_candidates: list[tuple[float, float, float, float, float]] = []
     if lines is not None:
         for x1, y1, x2, y2 in lines.reshape(-1, 4):
@@ -1150,7 +1168,7 @@ def _detect_wall_corners(
             length = (dx**2 + dy**2) ** 0.5
             angle_from_vertical = np.degrees(np.arctan2(dx, max(dy, 1e-6)))
             x_mid = (x1 + x2) / 2
-            if angle_from_vertical < 10 and length > min_line_length and margin < x_mid < width - margin:
+            if angle_from_vertical < max_axis_angle and length > min_line_length and margin < x_mid < width - margin:
                 hough_candidates.append((length, float(x1), float(y1), float(x2), float(y2)))
 
     # Complementary source: Hough needs one *unbroken* line segment of a minimum length, but a
@@ -1256,23 +1274,25 @@ def _detect_wall_corners(
             # disagree, under `require_shading` only.
             if require_shading:
                 shading_overwhelming = shading_overwhelming and depth_c >= 0.8
-            # `require_shading` (set only for horizontal-split detection — see
-            # `_detect_horizontal_wall_corners`) drops the depth-alone path and the "moderate gap on
-            # both signals" fallback, and additionally demands the product-corroboration path also
-            # clear a real shading-magnitude floor, not just consistency. Verified directly against
-            # three real false positives that only ever showed up on the horizontal axis: a
-            # perfectly flat wall accepted purely on depth (shading_gap=1.70, depth_gap=5.75,
-            # depth_c=1.00 — monocular depth models have a known bias toward reading "lower in
-            # frame" as "closer", which lines up exactly with a top-vs-bottom split); a piece of
-            # furniture's own shadow accepted via the gap fallback (shading_gap=11.04, shading_c=
-            # depth_c=0.77 — clears "gap>=1.5 and both consistent" while failing the stricter
-            # product test at 0.77*0.77=0.59); and a near-zero, noise-level shading blip that still
-            # passed the *product test itself* (shading_gap=0.99, shading_c=0.91, depth_c=1.00 —
-            # product 0.91 clears CORROBORATION_THRESHOLD on consistency alone, with essentially no
-            # real magnitude behind it). Both known-good horizontal splits (a real crown molding, a
-            # real window header) clear this floor easily (shading_gap 30+ in both cases), so it
-            # costs them nothing.
-            shading_floor_met = shading_g >= MIN_SHADING_GAP * 0.3
+            # A picture/painting hanging on the wall genuinely sits a little proud of it, which is
+            # real, measurable depth evidence too — verified directly: a framed picture produced
+            # shading_gap=8.62, shading_c=0.90, depth_gap=0.71, depth_c=1.00 (perfect depth
+            # agreement, same as a real corner) and still wrongly sliced straight through the frame.
+            # What actually separated it from a real horizontal line in the same photos: magnitude,
+            # not consistency — the real window header measured shading_gap=30.55 (3.5x this),
+            # depth_gap=1.41 (2x this). `require_shading` raises the floor the product-corroboration
+            # path demands accordingly, well clear of a frame's shallow real protrusion.
+            #
+            # A floor lamp standing in front of an otherwise flat wall produces the same class of
+            # false positive on the *vertical* axis (shading_gap=6.54, shading_c=0.85, depth_gap
+            # near-zero, product 0.816 clearing corroboration on consistency alone) — but raising
+            # this same floor for vertical corners broke real ones elsewhere (a real corner in one
+            # test photo relied on shading_gap=11.05 with a weak depth_c=0.69, comfortably below a
+            # 1.5x floor). Unlike the horizontal case, there wasn't a magnitude gap that separated
+            # the fake evidence from genuine vertical corners without also excluding real ones — so
+            # this floor stays scoped to `require_shading` (horizontal) only, where it's verified
+            # to cost nothing. The vertical lamp false positive is a known, unresolved case.
+            shading_floor_met = shading_g >= MIN_SHADING_GAP * (2.0 if require_shading else 0.3)
             depth_overwhelming = not require_shading and depth_c >= 0.85 and depth_g / MIN_DEPTH_GAP_Z >= 1.5
             corroborated = (
                 (shading_c * depth_c >= CORROBORATION_THRESHOLD and (not require_shading or shading_floor_met))
@@ -1320,19 +1340,24 @@ def _detect_wall_corners(
     # `refine_line` found nearby Canny edges to snap to: a soft, gradual corner shadow is exactly
     # the case Canny/Hough miss outright — the whole reason this candidate source exists — so
     # requiring Canny corroboration here would reject precisely the corners it's meant to catch.
-    for x in gradient_x:
-        x1, y1, x2, y2 = x, 0.0, x, float(height - 1)
-        x_top, _, x_bottom, _, _ = refine_line(x1, y1, x2, y2)
-        if not (margin < x_top < width - margin and margin < x_bottom < width - margin):
-            if __debug_corners__:
-                print(f"  [gradient reject] seed_x={x:.0f} out of margin bounds x_top={x_top:.0f} x_bottom={x_bottom:.0f}")
-            continue
-        accept, priority = score(x_top, x_bottom)
-        if not accept:
-            if __debug_corners__:
-                print(f"  [gradient reject] seed_x={x:.0f} weak/inconsistent evidence")
-            continue
-        refined.append((priority, (x_top + x_bottom) / 2, x_top, x_bottom))
+    #
+    # On the horizontal axis (`require_shading`) a gradient peak is usually a ceiling lighting
+    # falloff or the wall/floor line, not a soffit. Only a real Hough edge is allowed to split
+    # there — that is the actual architectural corner.
+    if not require_shading:
+        for x in gradient_x:
+            x1, y1, x2, y2 = x, 0.0, x, float(height - 1)
+            x_top, _, x_bottom, _, _ = refine_line(x1, y1, x2, y2)
+            if not (margin < x_top < width - margin and margin < x_bottom < width - margin):
+                if __debug_corners__:
+                    print(f"  [gradient reject] seed_x={x:.0f} out of margin bounds x_top={x_top:.0f} x_bottom={x_bottom:.0f}")
+                continue
+            accept, priority = score(x_top, x_bottom)
+            if not accept:
+                if __debug_corners__:
+                    print(f"  [gradient reject] seed_x={x:.0f} weak/inconsistent evidence")
+                continue
+            refined.append((priority, (x_top + x_bottom) / 2, x_top, x_bottom))
 
     refined.sort(key=lambda r: -r[0])
     if __debug_corners__:
@@ -1365,9 +1390,9 @@ def _detect_horizontal_wall_corners(
     implementation of that same evidence logic, this transposes the region and hands it to the
     already-validated `_detect_wall_corners` unchanged, then transposes its result back.
 
-    `require_shading=True` — see its own comment on `_detect_wall_corners` — closes two false-
+    `require_shading=True` — see its own comment on `_detect_wall_corners` — closes three false-
     positive patterns verified only on this axis: a monocular-depth-only "corner" on a perfectly
-    flat wall, and a piece of furniture's own shadow read as a corner via the moderate-gap fallback.
+    flat wall, a piece of furniture's own shadow, and an ordinary window/ceiling lighting gradient.
     No vanishing-point evidence here — this codebase only ever estimates a *vertical* vanishing
     point, which has nothing to say about a horizontal line's own tilt.
 
@@ -1396,16 +1421,11 @@ def _split_region_horizontally(
     region: dict, gray: np.ndarray, depth: np.ndarray | None, image_bgr: np.ndarray | None
 ) -> list[dict]:
     """Checks one already-finished wall region (post vertical-corner-splitting) for a genuine
-    horizontal architectural corner within it — either geometric (`_detect_horizontal_wall_corners`)
-    or a sustained solid color-block change on the same plane (`_detect_color_block_corners`,
-    transposed the same way) — and splits it top/bottom if one is found with real evidence.
-    Additive only, exactly like `_detect_color_block_corners` is for the vertical pass: every region
-    that already came out of the existing vertical-corner pipeline is untouched unless this finds
-    independent, strong evidence of its own for a *different* axis of split that pipeline was never
-    built to look for. Scoped to a region with a single simple quad — the common case, and the one
-    where "cut this quad in half and rebuild two smaller ones" is unambiguous; a region already
-    built from several irregular bands (`_quads_from_mask`, for a shape too irregular for one flat
-    quad) is left alone rather than guessing how to fold a second split axis into that.
+    horizontal architectural corner — a soffit, chair rail, or similar plane change — and splits
+    it top/bottom if `_detect_horizontal_wall_corners` finds one. Paint-color changes on a flat
+    plane are not corners and must not split the wall. Additive only: the region is untouched
+    unless there is independent geometric evidence of a horizontal corner. Scoped to a region with
+    a single simple quad; a region already built from several irregular bands is left alone.
     """
     quads = region["quads"]
     if len(quads) != 1:
@@ -1416,17 +1436,13 @@ def _split_region_horizontally(
         return [region]
     top_y, left_x, bottom_y, right_x = int(ys.min()), int(xs.min()), int(ys.max()), int(xs.max())
     height, width = bottom_y - top_y + 1, right_x - left_x + 1
-    if height < 80 or width < 80:
+    # Matches the lowered floor in `_detect_wall_corners`/`_detect_color_block_corners` — a narrow
+    # but real wall face (a nook's own return/side edge) still deserves a chance at its own
+    # molding split, not just the wide main wall faces either detector was originally sized around.
+    if height < 50 or width < 50:
         return [region]
 
     cuts = _detect_horizontal_wall_corners(gray, mask, depth=depth, max_corners=1)
-    if not cuts and image_bgr is not None:
-        # Transposed the same way `_detect_horizontal_wall_corners` transposes the geometric
-        # detector — reuses `_detect_color_block_corners` unchanged rather than a second
-        # implementation of the same Lab-deltaE evidence rule.
-        mask_t = np.ascontiguousarray(mask.T)
-        image_bgr_t = np.ascontiguousarray(image_bgr.transpose(1, 0, 2))
-        cuts = _detect_color_block_corners(image_bgr_t, mask_t)
     if not cuts:
         return [region]
     y_left, y_right = cuts[0]
@@ -1443,9 +1459,6 @@ def _split_region_horizontally(
     ]
     submasks = _split_mask_by_row_cuts(mask, all_cuts, float(left_x), float(right_x + 1))
 
-    # Same bar every vertical split already has to clear (see `MIN_SPLIT_SOLIDITY`/`min_wall_width_px`
-    # in `_extract_wall_regions_from_cluster`): both resulting bands must be a real, solid, usefully
-    # sized piece — a real soffit is a substantial band, not a sliver a segmentation wobble produced.
     min_band_height = max(15.0, height * 0.05)
 
     def band_height(m: np.ndarray) -> float:
@@ -1463,106 +1476,6 @@ def _split_region_horizontally(
         if r:
             new_regions.append(r)
     return new_regions if len(new_regions) == 2 else [region]
-
-
-# Perceptual color distance (CIE76 deltaE in Lab) above which two paint colors read as a genuinely
-# different, deliberate color choice — not two shades of the same color (white vs. off-white, one
-# side of a wall a little warmer from nearby light). Color-science references put "different colors,
-# not the same color" firmly above deltaE 20-25 (e.g. black-white and most fully-saturated hue-to-
-# hue swaps score 60-100+); 18 let real but subtle shading/white-balance differences within one
-# paint color — the exact case this must not split on — through often enough to matter. Set well
-# above that ordinary-variation range so only an unambiguous, deliberate color change qualifies.
-COLOR_BLOCK_DELTA_E = 35.0
-COLOR_BLOCK_CONSISTENCY = 0.75
-
-
-def _detect_color_block_corners(image_bgr: np.ndarray, mask: np.ndarray) -> list[tuple[float, float]]:
-    """Finds extra vertical cut candidates from a sustained, solid paint-color change alone — an
-    accent wall painted a different color from its neighbor, sitting on the exact same flat plane
-    (no depth step at all) with too soft/matte an edge for Canny to catch. That's exactly the case
-    `_detect_wall_corners`'s depth- and Hough-line-oriented evidence isn't built to find, since it
-    leans on a geometric (depth or crisp-edge) signal a same-plane color change never produces.
-
-    Deliberately a wholly separate pass from `_detect_wall_corners`, not a change to it: this only
-    ever *adds* extra candidates for the caller to merge in alongside whatever geometric evidence
-    already found, on top of the same min-separation/solidity/width checks every other candidate
-    still has to clear before it can actually split anything — it never removes or weakens any
-    existing corner evidence.
-    """
-    ys, xs = np.nonzero(mask)
-    if ys.size == 0:
-        return []
-    min_y, min_x, max_y, max_x = int(ys.min()), int(xs.min()), int(ys.max()), int(xs.max())
-    width = max_x - min_x + 1
-    height = max_y - min_y + 1
-    if width < 80 or height < 80:
-        return []
-
-    region_bgr = image_bgr[min_y : max_y + 1, min_x : max_x + 1]
-    region_mask = mask[min_y : max_y + 1, min_x : max_x + 1]
-    lab = cv2.cvtColor(region_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-
-    band = max(8, round(width * 0.03))
-    gutter = max(2, round(width * 0.006))
-    margin = max(15, round(width * 0.04))
-    step_y = max(1, height // 60)
-
-    # Distance to the nearest excluded-object hole (a lamp, a piece of furniture already punched
-    # out of `mask`) — a standing object right beside a sampling band casts real shadow/reflection
-    # onto the genuine wall pixels next to it, which reads as a real, consistent solid-color change
-    # even though it's just that object's own presence, not a second paint color. This is the exact
-    # failure mode `_detect_wall_corners`'s own hole-proximity issue took (a floor lamp read as an
-    # architectural corner) — same root cause, so the same kind of guard applies here too.
-    hole_dist = cv2.distanceTransform((region_mask > 0).astype(np.uint8), cv2.DIST_L2, 5)
-    hole_safety_px = max(30.0, width * 0.06)
-
-    def color_gap(x: int) -> tuple[float, float]:
-        diffs = []
-        for y in range(0, height, step_y):
-            lo, hi = x - gutter - band, x - gutter
-            lo2, hi2 = x + gutter, x + gutter + band
-            if lo < 0 or hi2 > width:
-                continue
-            lm = region_mask[y, lo:hi] > 0
-            rm = region_mask[y, lo2:hi2] > 0
-            if lm.sum() < band or rm.sum() < band:
-                continue
-            if hole_dist[y, lo:hi].min() < hole_safety_px or hole_dist[y, lo2:hi2].min() < hole_safety_px:
-                continue
-            left = lab[y, lo:hi][lm].mean(axis=0)
-            right = lab[y, lo2:hi2][rm].mean(axis=0)
-            diffs.append(float(np.linalg.norm(left - right)))
-        if len(diffs) < 8:
-            return 0.0, 0.0
-        arr = np.array(diffs)
-        return float(arr.mean()), float((arr >= COLOR_BLOCK_DELTA_E * 0.6).mean())
-
-    candidates: list[tuple[float, int]] = []
-    x = margin
-    while x < width - margin:
-        gap, consistency = color_gap(x)
-        if gap >= COLOR_BLOCK_DELTA_E and consistency >= COLOR_BLOCK_CONSISTENCY:
-            candidates.append((gap, x))
-        x += max(4, band // 2)
-
-    if not candidates:
-        return []
-
-    # Collapse a run of adjacent x's that all cleared the bar (the same real edge, sampled at
-    # several neighboring offsets) down to its single strongest point.
-    candidates.sort(key=lambda c: c[1])
-    clusters: list[list[tuple[float, int]]] = []
-    for gap, x in candidates:
-        if clusters and x - clusters[-1][-1][1] <= band:
-            clusters[-1].append((gap, x))
-        else:
-            clusters.append([(gap, x)])
-
-    picks: list[tuple[float, float]] = []
-    for cluster in clusters:
-        _, best_x = max(cluster)
-        picks.append((min_x + float(best_x), min_x + float(best_x)))
-    return picks
 
 
 SEAM_OVERLAP_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -1727,16 +1640,20 @@ def extract_wall_regions(
     regions = [r for r in regions if _is_regular_wall_shape(r["mask"])]
     # Additive only (see `_split_region_horizontally`): the vertical-corner pipeline above only
     # ever looks for left/right splits, so a real horizontal architectural line — a soffit above a
-    # recessed wall, a chair rail, a two-tone wall's own horizontal seam — never gets a chance to
-    # split anything on its own axis. Run once per already-finished region, after vertical
-    # splitting is completely done, so it only ever adds an extra top/bottom split on top of
-    # whatever the existing pipeline already decided, never changes it. Run *before*
-    # `_merge_same_column_regions` below, not after — that merge step's whole job is re-joining two
-    # same-column pieces that occlusion (not a real corner) pulled apart, and running this after it
-    # let it silently undo a genuine split right after this had just created it.
+    # recessed wall, a chair rail — never gets a chance to split anything on its own axis. Run here,
+    # before both merge passes below, so each merge sees the same per-cluster region shapes the
+    # vertical pipeline actually produced — running it after either merge changes a region's shape
+    # (by combining it with a same-column or small-fragment neighbor first) enough to sometimes
+    # miss a real horizontal corner that's plainly there beforehand. Each resulting piece is tagged
+    # `_no_occlusion_merge` so the two merge passes below — both built to re-join pieces occlusion
+    # pulled apart — leave it alone rather than silently re-joining a deliberate split.
     horizontally_split: list[dict] = []
     for region in regions:
-        horizontally_split.extend(_split_region_horizontally(region, gray, depth, image_bgr))
+        split = _split_region_horizontally(region, gray, depth, image_bgr)
+        if len(split) > 1:
+            for r in split:
+                r["_no_occlusion_merge"] = True
+        horizontally_split.extend(split)
     regions = horizontally_split
     # Deliberately a final pass over every *fully resolved* region, not something folded into the
     # recursive splitting above: a piece occluded by furniture in the middle of a column (a plant,
@@ -1774,28 +1691,50 @@ def extract_wall_regions(
         ys, xs = np.nonzero(r["mask"])
         return float(xs.mean()), float(ys.mean())
 
-    small = [r for r in regions if region_area_frac(r) < WALL_MIN_STANDALONE_FRACTION]
-    large = [r for r in regions if region_area_frac(r) >= WALL_MIN_STANDALONE_FRACTION]
+    # A region tagged by `_split_region_horizontally` is a deliberate split — a real molding strip
+    # above a narrow return/side wall face can legitimately be a small fraction of the *whole*
+    # frame even though it's a solid, obviously-separate surface, so it's exempt from this
+    # generic "too small to bother with, fold into whatever's nearest" absorption regardless of
+    # its own area fraction.
+    small_ids = {
+        id(r)
+        for r in regions
+        if region_area_frac(r) < WALL_MIN_STANDALONE_FRACTION and not r.get("_no_occlusion_merge")
+    }
+    small = [r for r in regions if id(r) in small_ids]
+    large = [r for r in regions if id(r) not in small_ids]
     if not small:
-        return large
-    if not large:
+        final_regions = large
+    elif not large:
         # Nothing bigger to fold into — keep every region as-is rather than losing real,
         # independently-visible wall area entirely just because none of it individually clears
         # the standalone-checkbox bar.
-        return regions
+        final_regions = regions
+    else:
+        large_masks = [r["mask"] for r in large]
+        large_centers = [region_center(r) for r in large]
+        for r in small:
+            cx, cy = region_center(r)
+            nearest = min(
+                range(len(large_centers)),
+                key=lambda i: (large_centers[i][0] - cx) ** 2 + (large_centers[i][1] - cy) ** 2,
+            )
+            large_masks[nearest] = cv2.bitwise_or(large_masks[nearest], r["mask"])
+        merged = [_region_from_member(m) for m in large_masks]
+        final_regions = [r for r in merged if r]
 
-    large_masks = [r["mask"] for r in large]
-    large_centers = [region_center(r) for r in large]
-    for r in small:
-        cx, cy = region_center(r)
-        nearest = min(
-            range(len(large_centers)),
-            key=lambda i: (large_centers[i][0] - cx) ** 2 + (large_centers[i][1] - cy) ** 2,
-        )
-        large_masks[nearest] = cv2.bitwise_or(large_masks[nearest], r["mask"])
-
-    merged = [_region_from_member(m) for m in large_masks]
-    return [r for r in merged if r]
+    # Additive only (see `_split_region_horizontally`): the vertical-corner pipeline above only
+    # ever looks for left/right splits, so a real horizontal architectural line — a soffit above a
+    # recessed wall, a chair rail — never gets a chance to split anything on its own axis.
+    # Deliberately the true last step in this function, after both merges above — a molding strip
+    # above a narrow return/side wall face can legitimately be a small fraction of the *whole*
+    # frame even though it's a real, solid, obviously-separate surface; running this before the
+    # small-region absorption above let that absorption fold it right back into its neighbor,
+    # silently undoing a genuine split the moment after this created it.
+    horizontally_split: list[dict] = []
+    for region in final_regions:
+        horizontally_split.extend(_split_region_horizontally(region, gray, depth, image_bgr))
+    return horizontally_split
 
 
 # Minimum "extent" (mask area / its own bounding-box area) a *small* wall region must have to be
@@ -1919,6 +1858,11 @@ SAME_COLUMN_WIDTH_RATIO = 2.0
 # fairly generous (a tall plant, a floor lamp) but is capped relative to the pieces' own height so
 # it can't bridge two things that just happen to be far apart vertically.
 SAME_COLUMN_MAX_GAP_RATIO = 0.6
+# A hairline y-gap (a few pixels) is what a horizontal architectural cut looks like after the
+# mask is partitioned — merging those two bands back together silently undoes a real soffit/chair-
+# rail split. Furniture occlusion leaves a much larger hole (a plant, a floor lamp). This floor
+# is the difference between those two cases.
+SAME_COLUMN_MIN_GAP_RATIO = 0.15
 
 
 def _merge_same_column_components(components: list[np.ndarray]) -> list[np.ndarray]:
@@ -1963,7 +1907,10 @@ def _merge_same_column_components(components: list[np.ndarray]) -> list[np.ndarr
         gap = max(y0a, y0b) - min(y1a, y1b)
         if gap <= 0:
             return False
-        max_gap = SAME_COLUMN_MAX_GAP_RATIO * min(y1a - y0a + 1, y1b - y0b + 1)
+        shorter = min(y1a - y0a + 1, y1b - y0b + 1)
+        if gap < SAME_COLUMN_MIN_GAP_RATIO * shorter:
+            return False
+        max_gap = SAME_COLUMN_MAX_GAP_RATIO * shorter
         return gap <= max_gap
 
     merged: list[np.ndarray] = []
@@ -2004,10 +1951,17 @@ def _merge_same_column_regions(regions: list[dict]) -> list[dict]:
     """
     if len(regions) <= 1:
         return regions
-    merged_masks = _merge_same_column_components([r["mask"] for r in regions])
-    if len(merged_masks) == len(regions):
+    # A region tagged by `_split_region_horizontally` is a deliberate split, not an occlusion
+    # fragment — this function's whole job is undoing the latter, so it never even sees the
+    # former: pulled out before merging, added back unchanged after.
+    protected = [r for r in regions if r.get("_no_occlusion_merge")]
+    mergeable = [r for r in regions if not r.get("_no_occlusion_merge")]
+    if len(mergeable) <= 1:
         return regions
-    out = []
+    merged_masks = _merge_same_column_components([r["mask"] for r in mergeable])
+    if len(merged_masks) == len(mergeable):
+        return regions
+    out = list(protected)
     for m in merged_masks:
         region = _region_from_member(m)
         if region:
@@ -2073,21 +2027,6 @@ def _extract_wall_regions_from_cluster(
     bbox = (int(ys.min()), int(xs.min()), int(ys.max()), int(xs.max()))
     top_y, bottom_y = float(bbox[0]), float(bbox[2])
     corners = _detect_wall_corners(gray, mask, vp=vp, depth=depth)
-
-    # Additive only (see `_detect_color_block_corners`): a sustained solid paint-color change with
-    # no depth step and no crisp edge for Canny to catch — a same-plane accent wall — that the
-    # geometric pass above isn't built to find on its own. Merged in here, after the fact, so it
-    # only ever proposes *extra* cuts on top of whatever `_detect_wall_corners` already found,
-    # never replacing or weakening that evidence.
-    if image_bgr is not None:
-        width = bbox[3] - bbox[1] + 1
-        color_min_separation = max(20.0, width * 0.03)
-        for color_top, color_bottom in _detect_color_block_corners(image_bgr, mask):
-            color_mid = (color_top + color_bottom) / 2
-            if any(abs(color_mid - (ct + cb) / 2) < color_min_separation for ct, cb in corners):
-                continue
-            corners.append((color_top, color_bottom))
-        corners.sort(key=lambda c: c[0] + c[1])
 
     def build(cut_points: list[tuple[float, float]]) -> tuple[list, list]:
         cuts = [(float(bbox[1]), float(bbox[1])), *cut_points, (float(bbox[3] + 1), float(bbox[3] + 1))]
@@ -2251,7 +2190,8 @@ def analyze_image(image_bytes: bytes, target_width: int, target_height: int, deb
     vp = _estimate_vertical_vanishing_point(gray)
 
     segmenter = get_segmenter()
-    outputs, floor_prob = _segment(image, segmenter, extra_prob_label="floor")
+    outputs, extra_probs = _segment(image, segmenter, extra_prob_labels=("floor",))
+    floor_prob = extra_probs["floor"]
 
     # A rug/carpet sits directly on the floor and isn't its own separate real object the way
     # furniture is — treating it as "not floor" leaves most of a real room's visible floor area
@@ -2452,6 +2392,18 @@ def analyze_image(image_bytes: bytes, target_width: int, target_height: int, deb
         if encode_guide_gray is not None:
             wall_occupied_encoded = _guided_filter_refine(wall_occupied_encoded, encode_guide_gray, r=4, eps=0.01)
             floor_occupied_encoded = _guided_filter_refine(floor_occupied_encoded, encode_guide_gray, r=4, eps=0.01)
+        # A small safety margin around the wall exclusion specifically, on top of everything above:
+        # `_smooth_mask_contours` (run on the wall mask right before this, to straighten a real
+        # architectural line) can still nudge the wall's own boundary a couple of pixels outward
+        # right where it runs beside a real excluded object — a curtain, a window frame — even after
+        # every fix above. Growing the exclusion itself by a couple of real pixels can only ever
+        # shrink the painted wall area a hair right at such an edge, never invent false wall
+        # elsewhere, so this is one-directional: it costs a sliver of paintable area directly next
+        # to a real object, in exchange for that area never visibly reading as painted-over fabric.
+        wall_margin_px = max(1, round(2 * encode_scale))
+        wall_occupied_encoded = cv2.dilate(
+            wall_occupied_encoded, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (wall_margin_px * 2 + 1,) * 2)
+        )
 
     def encode(region, kind, index):
         mask_to_encode = region["mask"]
