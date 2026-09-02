@@ -24,14 +24,24 @@ interface Regions {
   wall: DetectedRegion[];
 }
 
+// A surface deliberately put back to the original photo, as opposed to one simply not chosen
+// yet. The two need to be distinguishable: the seeded surface falls back to a design when
+// unchosen, so "no key" cannot mean "show the photo".
+const NO_DESIGN = "__none__";
+
+const SURFACE_ORDER: RegionKind[] = ["floor", "wall"];
+const SURFACE_LABEL: Record<RegionKind, string> = { floor: "Floor", wall: "Walls" };
+// Singular for the picker heading — "Walls design" reads as a typo where "Wall design" doesn't.
+const SURFACE_DESIGN_LABEL: Record<RegionKind, string> = { floor: "Floor", wall: "Wall" };
+
 export default function Home() {
   const [phase, setPhase] = useState<Phase>("upload");
   const [processingMessage, setProcessingMessage] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [photo, setPhoto] = useState<Photo | null>(null);
   const [regions, setRegions] = useState<Regions>({ floor: [], wall: [] });
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [assignments, setAssignments] = useState<DesignAssignment>({});
+  const [activeSurface, setActiveSurface] = useState<RegionKind>("floor");
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [catalog, setCatalog] = useState<CatalogItem[]>([]);
   const [catalogError, setCatalogError] = useState<string | null>(null);
@@ -79,8 +89,8 @@ export default function Home() {
 
       setPhoto({ url, image: fullImage, width, height });
       setRegions(result);
-      setSelectedIds(new Set());
       setAssignments({});
+      setActiveSurface(result.floor.length > 0 ? "floor" : "wall");
       setPhase("workspace");
     } catch (err) {
       console.error(err);
@@ -103,89 +113,91 @@ export default function Home() {
     setPhoto(null);
     setPendingFile(null);
     setRegions({ floor: [], wall: [] });
-    setSelectedIds(new Set());
     setAssignments({});
   };
 
-  const toggleSelect = (id: string) =>
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-
-  const deselectAll = () => setSelectedIds(new Set());
-
-  const selectAllSurfaces = () =>
-    setSelectedIds(new Set([...regions.floor, ...regions.wall].map((r) => r.id)));
-
-  const selectAllFloor = () => setSelectedIds(new Set(regions.floor.map((r) => r.id)));
-  const selectAllWall = () => setSelectedIds(new Set(regions.wall.map((r) => r.id)));
-
-  const applyDesignToSelection = (catalogId: string) =>
-    setAssignments((prev) => {
-      const next = { ...prev };
-      for (const id of selectedIds) next[id] = catalogId;
-      return next;
-    });
-
-  const applyDesignToIds = (ids: string[], catalogId: string) =>
-    setAssignments((prev) => {
-      const next = { ...prev };
-      for (const id of ids) next[id] = catalogId;
-      return next;
-    });
-
-  const floorIdSet = useMemo(() => new Set(regions.floor.map((r) => r.id)), [regions]);
-  const wallIdSet = useMemo(() => new Set(regions.wall.map((r) => r.id)), [regions]);
-
-  const selectedFloorIds = useMemo(() => [...selectedIds].filter((id) => floorIdSet.has(id)), [selectedIds, floorIdSet]);
-  const selectedWallIds = useMemo(() => [...selectedIds].filter((id) => wallIdSet.has(id)), [selectedIds, wallIdSet]);
-
-  // When the selection spans both floors and walls (e.g. via "Select all surfaces"), only
-  // designs valid for both kinds make sense to offer in the shared picker — anything floor-only
-  // or wall-only would silently do nothing on the other kind's regions if applied from there.
-  const selectedKinds = useMemo(() => {
-    const kinds = new Set<RegionKind>();
-    if (selectedFloorIds.length > 0) kinds.add("floor");
-    if (selectedWallIds.length > 0) kinds.add("wall");
-    return kinds;
-  }, [selectedFloorIds, selectedWallIds]);
-
-  const isMixedSelection = selectedKinds.size > 1;
-
-  const activeCatalog = useMemo(() => {
-    const kind = [...selectedKinds][0];
-    return kind ? catalogByKind(catalog, kind) : catalog;
-  }, [catalog, selectedKinds]);
-
-  // Split out for the mixed-selection case: a shared picker (designs rated for both, e.g. tile)
-  // applies to the whole selection, but each surface also gets its own picker underneath for
-  // designs that only make sense on it (flooring is floor-only) — picking one of those only
-  // reassigns that surface's regions, leaving whatever the shared picker set for the other alone.
-  const sharedCatalog = useMemo(
-    () => catalog.filter((item) => item.applicableTo.includes("floor") && item.applicableTo.includes("wall")),
-    [catalog],
-  );
-  const floorOnlyCatalog = useMemo(
-    () => catalog.filter((item) => item.applicableTo.includes("floor") && !item.applicableTo.includes("wall")),
-    [catalog],
-  );
-  const wallOnlyCatalog = useMemo(
-    () => catalog.filter((item) => item.applicableTo.includes("wall") && !item.applicableTo.includes("floor")),
-    [catalog],
+  const regionsOf = useCallback(
+    (kind: RegionKind) => (kind === "floor" ? regions.floor : regions.wall),
+    [regions],
   );
 
-  const commonDesignFor = (ids: string[]) => {
-    const values = ids.map((id) => assignments[id]);
-    if (values.length === 0) return undefined;
-    return values.every((v) => v === values[0]) ? values[0] : undefined;
-  };
+  /** Assigns one design to a whole surface at once — a surface is the unit a design applies to. */
+  const applyToSurface = useCallback(
+    (kind: RegionKind, catalogId: string) =>
+      setAssignments((prev) => {
+        const next = { ...prev };
+        for (const region of regionsOf(kind)) next[region.id] = catalogId;
+        return next;
+      }),
+    [regionsOf],
+  );
 
-  const selectedCommonDesign = useMemo(() => commonDesignFor([...selectedIds]), [selectedIds, assignments]);
-  const floorCommonDesign = useMemo(() => commonDesignFor(selectedFloorIds), [selectedFloorIds, assignments]);
-  const wallCommonDesign = useMemo(() => commonDesignFor(selectedWallIds), [selectedWallIds, assignments]);
+  /** Puts one surface back to how it looks in the photo.
+   *
+   * Needed now that a surface is only painted when it is explicitly chosen: without this, trying
+   * a wall design is a one-way door, and the only way back is re-analysing the whole photo from
+   * "Start over". The sentinel matters — deleting the key would fall back to the seeded default
+   * for the seeded surface, which is a design, not the original photo.
+   */
+  const clearSurface = useCallback(
+    (kind: RegionKind) =>
+      setAssignments((prev) => {
+        const next = { ...prev };
+        for (const region of regionsOf(kind)) next[region.id] = NO_DESIGN;
+        return next;
+      }),
+    [regionsOf],
+  );
+
+  // Exactly one surface gets a design on arrival, and only that one — every other surface stays
+  // as it looks in the photo until a design is picked for it explicitly.
+  //
+  // Seeding *every* detected surface was wrong, and visibly so. Someone who came to look at
+  // flooring got their walls retiled too, in a design they never chose; and since a wall boundary
+  // is much harder than a floor one (pendant lights, curtain edges, the ceiling line), that
+  // unrequested wall paint is also where the roughest edges in the whole render are. So it made
+  // the app look broken while answering a question nobody asked. One surface at a time is also
+  // how the surface toggle already reads: switching to Walls means "now I want to change the
+  // walls", not "the walls have been changed for a while and here are the controls".
+  //
+  // Still derived rather than written into `assignments` on load, so `assignments` holds only
+  // real choices — no "already seeded this photo?" flag, and no frame where the room shows
+  // nothing while seeding catches up.
+  const seededSurface: RegionKind | null = useMemo(() => {
+    // Floor first when the photo has one: it is the larger, better-behaved surface and the usual
+    // reason someone opens a room visualizer at all. A wall-only photo seeds the wall instead,
+    // so the detection still visibly did something.
+    if (regionsOf("floor").length > 0) return "floor";
+    if (regionsOf("wall").length > 0) return "wall";
+    return null;
+  }, [regionsOf]);
+
+  const effectiveAssignments = useMemo(() => {
+    const next: DesignAssignment = {};
+    for (const kind of SURFACE_ORDER) {
+      const fallback = kind === seededSurface ? catalogByKind(catalog, kind)[0] : undefined;
+      for (const region of regionsOf(kind)) {
+        const design = assignments[region.id] ?? fallback?.id;
+        if (design && design !== NO_DESIGN) next[region.id] = design;
+      }
+    }
+    return next;
+  }, [assignments, catalog, regionsOf, seededSurface]);
+
+  const availableSurfaces = useMemo(
+    () => SURFACE_ORDER.filter((kind) => regionsOf(kind).length > 0),
+    [regionsOf],
+  );
+
+  const activeCatalog = useMemo(
+    () => catalogByKind(catalog, activeSurface),
+    [catalog, activeSurface],
+  );
+
+  const activeDesignId = useMemo(() => {
+    const list = regionsOf(activeSurface);
+    return list.length > 0 ? effectiveAssignments[list[0].id] : undefined;
+  }, [regionsOf, activeSurface, effectiveAssignments]);
 
   return (
     <div className="flex flex-1 flex-col bg-zinc-50 dark:bg-black">
@@ -213,8 +225,8 @@ export default function Home() {
                 See new flooring and tiles in your own room
               </h1>
               <p className="mt-2 text-sm text-zinc-500 dark:text-zinc-400">
-                Upload a photo, and we&apos;ll find the floor and walls automatically so you can try
-                on real designs.
+                Upload a photo, and we&apos;ll find the floor and walls automatically and apply a
+                design straight away.
               </p>
             </div>
 
@@ -246,19 +258,13 @@ export default function Home() {
                 imgHeight={photo.height}
                 floorRegions={regions.floor}
                 wallRegions={regions.wall}
-                selectedIds={selectedIds}
-                onToggleSelect={toggleSelect}
-                onDeselectAll={deselectAll}
-                onSelectAllSurfaces={selectAllSurfaces}
-                onSelectAllFloor={selectAllFloor}
-                onSelectAllWall={selectAllWall}
-                assignments={assignments}
+                assignments={effectiveAssignments}
                 catalog={catalog}
               />
               <p className="text-xs text-zinc-400">
-                Tap a highlighted checkbox on the photo to select that part — walls are split at
-                each detected corner, so you can give each side its own design. Use &ldquo;Select
-                whole floor/wall&rdquo; to apply one design across every part of a surface instead.
+                Pick a design and it covers the whole surface at once — the floor is one surface and
+                the walls are another, each kept in correct perspective around every corner the
+                photo actually has.
               </p>
             </div>
 
@@ -267,42 +273,53 @@ export default function Home() {
                 <ErrorBanner title="Couldn't load designs" message={catalogError} />
               )}
 
-              {selectedIds.size === 0 ? (
-                <div className="flex flex-1 items-center justify-center rounded-2xl border border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-400 dark:border-zinc-700">
-                  Select one or more highlighted areas on the photo to choose a design for them.
+              {availableSurfaces.length > 1 && (
+                <div className="flex rounded-full border border-zinc-200 bg-white p-1 dark:border-zinc-700 dark:bg-zinc-900">
+                  {availableSurfaces.map((kind) => (
+                    <button
+                      key={kind}
+                      type="button"
+                      onClick={() => setActiveSurface(kind)}
+                      aria-pressed={activeSurface === kind}
+                      className={`flex-1 rounded-full px-3 py-1.5 text-xs font-medium transition-colors ${
+                        activeSurface === kind
+                          ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900"
+                          : "text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
+                      }`}
+                    >
+                      {SURFACE_LABEL[kind]}
+                    </button>
+                  ))}
                 </div>
-              ) : isMixedSelection ? (
-                <div className="flex flex-col gap-6">
-                  <DesignPicker
-                    title="Wall + floor design"
-                    items={sharedCatalog}
-                    selectedId={selectedCommonDesign}
-                    onSelect={applyDesignToSelection}
-                  />
-                  {floorOnlyCatalog.length > 0 && (
-                    <DesignPicker
-                      title="Floor only"
-                      items={floorOnlyCatalog}
-                      selectedId={floorCommonDesign}
-                      onSelect={(id) => applyDesignToIds(selectedFloorIds, id)}
-                    />
-                  )}
-                  {wallOnlyCatalog.length > 0 && (
-                    <DesignPicker
-                      title="Wall only"
-                      items={wallOnlyCatalog}
-                      selectedId={wallCommonDesign}
-                      onSelect={(id) => applyDesignToIds(selectedWallIds, id)}
-                    />
-                  )}
+              )}
+
+              {activeCatalog.length === 0 ? (
+                <div className="flex flex-1 items-center justify-center rounded-2xl border border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-400 dark:border-zinc-700">
+                  No designs available for this surface yet.
                 </div>
               ) : (
-                <DesignPicker
-                  title={`${[...selectedKinds][0] === "wall" ? "Wall" : "Floor"} design`}
-                  items={activeCatalog}
-                  selectedId={selectedCommonDesign}
-                  onSelect={applyDesignToSelection}
-                />
+                <div className="flex flex-col gap-2">
+                  <DesignPicker
+                    title={`${SURFACE_DESIGN_LABEL[activeSurface]} design`}
+                    items={activeCatalog}
+                    selectedId={activeDesignId}
+                    onSelect={(id) => applyToSurface(activeSurface, id)}
+                  />
+                  {activeDesignId ? (
+                    <button
+                      type="button"
+                      onClick={() => clearSurface(activeSurface)}
+                      className="self-start text-xs font-medium text-zinc-500 underline decoration-dotted hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
+                    >
+                      Remove {SURFACE_DESIGN_LABEL[activeSurface].toLowerCase()} design
+                    </button>
+                  ) : (
+                    <p className="text-xs text-zinc-400">
+                      Showing the original {SURFACE_DESIGN_LABEL[activeSurface].toLowerCase()} —
+                      pick a design to change it.
+                    </p>
+                  )}
+                </div>
               )}
             </div>
           </div>

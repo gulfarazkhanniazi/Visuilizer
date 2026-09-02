@@ -1,4 +1,4 @@
-import { Quad } from "./types";
+import { Quad, RegionKind, TileSizeMm } from "./types";
 
 export function quadWidthPx(quad: Quad): number {
   const top = Math.hypot(quad[1].x - quad[0].x, quad[1].y - quad[0].y);
@@ -12,47 +12,87 @@ export function quadHeightPx(quad: Quad): number {
   return (left + right) / 2;
 }
 
+export interface TileUv {
+  repeatX: number;
+  repeatY: number;
+  offsetX: number;
+  offsetY: number;
+}
+
+// Typical interior dimensions, used when this photo's perspective could not be estimated.
+// `widthM` is across the surface; `otherM` is into the room for a floor, or floor-to-ceiling for a
+// wall. Both are ordinary domestic figures, and they are assumptions rather than measurements —
+// which is exactly why they are named and in one place.
+const ASSUMED_ROOM = {
+  floor: { widthM: 4.5, otherM: 3.5 },
+  wall: { widthM: 4.0, otherM: 2.4 },
+} as const;
+
+/** Real size in metres of the surface patch one quad covers, as measured by the service. */
+export interface QuadWorldSize {
+  widthM: number;
+  heightM: number;
+}
+
 /**
- * Chooses tile-texture repeat counts so each individual tile reads as the *same real-world size*
- * everywhere it's used, on any quad, regardless of that particular surface's own size — the same
- * way a real tile installation works: a small return wall shows fewer tiles than the big wall
- * next to it, not the same handful of tiles blown up to fill it. `referenceWidthPx` anchors that
- * apparent tile size once per photo (`density` tiles across a surface that wide), so a half-width
- * wall gets roughly half as many repeats — smaller in count, identical in apparent size — instead
- * of the same repeat count stretched to a different physical size.
+ * Repeat counts that make one tile cover its real manufactured size on the real surface.
  *
- * Also returns a UV `offsetX`/`offsetY` anchored to the quad's own top-left corner in *absolute*
- * image-pixel space (scaled by that same physical tile size), instead of every quad restarting
- * its tile pattern at UV (0,0). A floor is frequently rendered as several quads — stacked bands
- * fit to an irregular mask shape, or several separate detected floor regions split apart by
- * furniture — and without this, each one shows a tile grid with its own arbitrary phase, so the
- * whole floor reads as disconnected patches instead of one continuous, identically-tiled surface.
- * Two quads that are genuinely adjacent in the photo share (near enough) the same pixel position
- * along their common edge, so anchoring offset to absolute position makes their tile grids line
- * up there automatically — the same way real tile installers snap every cut to one shared grid
- * instead of starting each panel's pattern over from its own corner.
+ * This used to take a `density` — "about 10 tiles across the photo" — which made every product
+ * cover a room in the same number of pieces regardless of its actual size, so 600x600mm porcelain
+ * and a 150x900mm plank looked identical. Physical size is the whole point of a visualizer: it is
+ * how someone judges whether a tile suits a room.
+ *
+ * With the patch's real extent known, "tiles across" is simply that extent divided by the tile's
+ * width, and the perspective foreshortening is entirely the shader homography's job — the quad is
+ * a real plane's projection, so mapping the unit square onto it projectively reproduces exactly
+ * what a camera does to a tiled floor.
  */
 export function computeTileUv(
   quad: Quad,
-  texWidth: number,
-  texHeight: number,
-  density: number,
-  referenceWidthPx: number,
-): { repeatX: number; repeatY: number; offsetX: number; offsetY: number } {
-  const w = quadWidthPx(quad);
-  const h = quadHeightPx(quad);
-  const aspect = texWidth / texHeight || 1;
-  const tileWidthPx = Math.max(1, referenceWidthPx) / Math.max(1, density);
-  const tileHeightPx = tileWidthPx / aspect;
-  // Deliberately *not* floored at 1: a real physical strip narrower than one tile shows a
-  // cropped slice of that tile, not one whole tile stretched to fill the strip — flooring this
-  // at 1 was exactly what broke scale consistency on any small/narrow selected part, since it
-  // silently blew a fractional tile back up to a full one while its wider neighbor, needing no
-  // such rescue, stayed at the correct real scale. The tile texture wraps (`gl.REPEAT`), so a
-  // fractional repeat still samples correctly — it's just less than one full cycle of it.
-  const repeatX = Math.max(0.02, w / tileWidthPx);
-  const repeatY = Math.max(0.02, (repeatX * aspect * h) / Math.max(1, w));
-  const offsetX = quad[0].x / tileWidthPx;
-  const offsetY = quad[0].y / tileHeightPx;
-  return { repeatX, repeatY, offsetX, offsetY };
+  kind: RegionKind,
+  tile: TileSizeMm,
+  world: QuadWorldSize | null,
+): TileUv {
+  // Defensive: a catalog entry from a cached payload predating physical sizes has no `size` at
+  // all, and reading through it threw rather than degrading. The renderer should never be the
+  // thing that breaks over a missing product attribute.
+  const safe: TileSizeMm =
+    tile && tile.widthMm > 0 && tile.heightMm > 0 ? tile : { widthMm: 600, heightMm: 600, known: false };
+  const tileW = safe.widthMm / 1000;
+  const tileH = safe.heightMm / 1000;
+
+  let widthM: number;
+  let heightM: number;
+  if (world && world.widthM > 0.05 && world.heightM > 0.05) {
+    widthM = world.widthM;
+    heightM = world.heightM;
+  } else {
+    // The surface didn't fit one plane well enough for the service to measure it. Assume an
+    // ordinary room rather than dropping back to a scale-free repeat count: real product sizes
+    // then still differ from each other correctly, and only the absolute size is assumed.
+    const assumed = ASSUMED_ROOM[kind];
+    if (kind === "floor") {
+      widthM = assumed.widthM;
+      heightM = assumed.otherM;
+    } else {
+      // Anchor on floor-to-ceiling height, the one wall dimension that is reliably standard, and
+      // derive this face's width from its own pixel aspect so every face shares one scale.
+      const perPixel = assumed.otherM / Math.max(1, quadHeightPx(quad));
+      heightM = assumed.otherM;
+      widthM = Math.max(0.2, quadWidthPx(quad) * perPixel);
+    }
+  }
+
+  // Anchor the pattern's phase to absolute image position, so two quads meeting at a real corner
+  // continue one grid rather than each restarting its own. Expressed in tiles: how many tile
+  // widths from the image origin this quad's corner sits, using this surface's own metres-per-pixel.
+  const metresPerPx = widthM / Math.max(1, quadWidthPx(quad));
+  const tileWidthPx = tileW / Math.max(1e-6, metresPerPx);
+
+  return {
+    repeatX: Math.max(0.02, widthM / tileW),
+    repeatY: Math.max(0.02, heightM / tileH),
+    offsetX: quad[0].x / Math.max(1, tileWidthPx),
+    offsetY: 0,
+  };
 }

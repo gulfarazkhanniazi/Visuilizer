@@ -6,6 +6,7 @@ accuracy and better speed than in-browser WASM.
 from __future__ import annotations
 
 import io
+import math
 from functools import lru_cache
 
 import cv2
@@ -107,7 +108,11 @@ def _segment(
     label_map = probs_t.argmax(dim=0).cpu().numpy()
 
     label2id = {lbl.strip(): idx for idx, lbl in segmenter.model.config.id2label.items()}
-    extra_probs = {lbl: probs_t[label2id[lbl]].cpu().numpy() for lbl in extra_prob_labels}
+    extra_probs = {
+        lbl: probs_t[label2id[lbl]].cpu().numpy()
+        for lbl in extra_prob_labels
+        if lbl in label2id
+    }
 
     outputs = []
     for idx, label in segmenter.model.config.id2label.items():
@@ -462,6 +467,120 @@ def _occupied_mask(
     return occupied
 
 
+def _components_corroborated_by(
+    mask: np.ndarray, evidence: np.ndarray, min_overlap_frac: float = 0.04
+) -> np.ndarray:
+    """Keeps only those connected components of `mask` that `evidence` independently agrees with.
+
+    Per component rather than per pixel, deliberately: the two signals are good at different
+    things. Texture finds an object's full extent but says nothing about whether it is an object;
+    depth says something *is* raised but its map is coarse and blocky, so it rarely covers the
+    whole shape. Intersecting them pixel-wise would keep only the blocky overlap and shred the
+    object's real outline. Requiring a component to overlap the evidence *somewhere* keeps its
+    full, well-shaped extent while still throwing out components nothing corroborates.
+    """
+    if not mask.any() or not evidence.any():
+        return np.zeros_like(mask)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    kept = np.zeros_like(mask)
+    for i in range(1, n):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area == 0:
+            continue
+        comp = labels == i
+        if (comp & (evidence > 0)).sum() / area >= min_overlap_frac:
+            kept[comp] = 255
+    return kept
+
+
+def _res_scale(shape: tuple[int, ...]) -> float:
+    """This photo's analysis resolution as a fraction of the one the file's pixel constants suit.
+
+    Every morphology radius, window size and dilation count here is a pixel count, and a pixel
+    count only means something relative to the resolution it was measured at. These were measured
+    against photos analysed near `MAX_ANALYSIS_DIMENSION` (the comments throughout cite a 1500px
+    example), and `analyze_image` caps the analysis size but never raises it — so a 547px stock
+    photo gets the same absolute margins as a downscaled 4000px phone shot, which in its own terms
+    are roughly three times too wide. That is what produced a thick unpainted halo of original
+    photo around every object on small photos: not one bad constant, but every exclusion-shaping
+    constant at once being oversized for the image it was applied to.
+
+    `_refine_thin_object_mask` already documents this exact hazard and claims the rest of the file
+    scales with resolution; this is what makes that true.
+    """
+    return max(shape[:2]) / MAX_ANALYSIS_DIMENSION
+
+
+def _res_px(shape: tuple[int, ...], reference_px: float, minimum: int = 1) -> int:
+    """A pixel constant tuned at `MAX_ANALYSIS_DIMENSION`, converted to this photo's resolution."""
+    return max(minimum, round(reference_px * _res_scale(shape)))
+
+
+def _res_odd(shape: tuple[int, ...], reference_px: float, minimum: int = 3) -> int:
+    """As `_res_px`, forced odd — for filter windows and structuring elements that need a centre."""
+    n = _res_px(shape, reference_px, minimum)
+    return n if n % 2 == 1 else n + 1
+
+
+# Classes that routinely lose the argmax against "wall" while still scoring on it, and that are
+# never part of a wall when present. A backlit sheer curtain reads 61% wall / 15% curtain; a
+# pendant lamp and the shadow it throws read as wall with the lamp a distant second. Each is
+# recovered by growing the class's own confident detection into the area it still plausibly covers
+# (see `_grow_class_by_hysteresis`), which is inert wherever the class isn't confidently present.
+UNDER_DETECTED_AGAINST_WALL = (
+    "curtain",
+    "lamp",
+    "chandelier",
+    "light",
+    "sconce",
+    # The ceiling and the window are not objects, but they fail the same way and matter more: the
+    # wall/ceiling line and the soffit above a window are long, straight, highly visible edges, and
+    # a design bleeding across either reads instantly as broken. Measured on a real test photo, a
+    # strip above a window came back 68% wall / 27% windowpane and was painted 66% solid.
+    "ceiling",
+    "windowpane",
+)
+
+# Probability a pixel must retain for the class to claim it, once contiguous with a confident
+# detection of that same class. Low on purpose: the contact requirement is what makes this safe,
+# not the threshold.
+HYSTERESIS_WEAK_THRESHOLD = 0.10
+
+
+def _grow_class_by_hysteresis(
+    confident: np.ndarray, prob: np.ndarray, weak_threshold: float
+) -> np.ndarray:
+    """Extends a confidently detected class into touching regions where it stays plausible.
+
+    Canny's double threshold, applied to a semantic class instead of gradients. A pixel with only
+    moderate probability of being a curtain proves little alone; the same pixel in a region that
+    touches an unmistakable curtain is almost certainly more of that curtain.
+
+    This exists for one specific, reproducible failure. A backlit sheer panel hanging between two
+    drapes came back 61% "wall", 15% "curtain" - it is bright, smooth and low-texture, exactly what
+    a sunlit wall looks like - so wall won the argmax and nothing excluded it. The design painted
+    over the curtain. Neither the texture detector nor the depth detector can catch it: the panel
+    genuinely is flat and genuinely sits at the wall's own depth.
+
+    Deliberately not a flat threshold on the probability map, which was tried first and fired on
+    any faint trace of the class anywhere in the photo, measurably worsening unrelated images.
+    Requiring contact with a confident detection keeps this to surfaces that demonstrably contain a
+    curtain, and makes it inert on photos with none.
+    """
+    if not confident.any():
+        return np.zeros_like(confident)
+    weak = (prob > weak_threshold).astype(np.uint8) * 255
+    if not weak.any():
+        return np.zeros_like(confident)
+    n, labels, _stats, _c = cv2.connectedComponentsWithStats(weak, connectivity=8)
+    kept = np.zeros_like(confident)
+    for i in range(1, n):
+        comp = labels == i
+        if (comp & (confident > 0)).any():
+            kept[comp] = 255
+    return kept
+
+
 def _detect_textured_objects(gray: np.ndarray, surface_mask: np.ndarray) -> np.ndarray:
     """Finds flat, wall/floor-mounted decor the segmentation model reads as part of the surface
     itself — a woven wall hanging, a patterned rug the "rug" class missed, anything textured
@@ -476,7 +595,7 @@ def _detect_textured_objects(gray: np.ndarray, surface_mask: np.ndarray) -> np.n
     rug, a textured accent wall) than a discrete object sitting on it; better to leave a real
     textured surface intact than risk carving a big hole out of a design over a false alarm.
     """
-    win = 9
+    win = _res_odd(gray.shape, 9)
     gray_f = gray.astype(np.float32)
     mean = cv2.blur(gray_f, (win, win))
     sq_mean = cv2.blur(gray_f * gray_f, (win, win))
@@ -490,7 +609,8 @@ def _detect_textured_objects(gray: np.ndarray, surface_mask: np.ndarray) -> np.n
     # both colors, then drops back to near-zero on either side. Opening with a kernel wider than
     # that strip erases the seam entirely while a genuinely wide object survives — do this before
     # closing, not after, or closing just thickens the seam into something wide enough to survive.
-    textured = cv2.morphologyEx(textured, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)))
+    open_k = _res_odd(gray.shape, 21, 5)
+    textured = cv2.morphologyEx(textured, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k, open_k)))
     textured = cv2.morphologyEx(textured, cv2.MORPH_CLOSE, MORPH_KERNEL, iterations=2)
 
     img_area = gray.shape[0] * gray.shape[1]
@@ -504,7 +624,7 @@ def _detect_textured_objects(gray: np.ndarray, surface_mask: np.ndarray) -> np.n
 
 
 def _depth_foreground_mask(
-    surface_mask: np.ndarray, depth: np.ndarray | None, local_win: int = 41, margin: float = 0.9
+    surface_mask: np.ndarray, depth: np.ndarray | None, local_win: int | None = None, margin: float = 0.9
 ) -> np.ndarray:
     """Flags pixels within `surface_mask` (a candidate wall/floor mask) whose relative depth is
     anomalously *closer to the camera* than their own local neighborhood — the signature of a real
@@ -532,7 +652,10 @@ def _depth_foreground_mask(
     present = surface_mask > 0
     fallback = float(np.median(depth[present]))
     filled = np.where(present, depth, fallback).astype(np.float32)
-    win = local_win if local_win % 2 == 1 else local_win + 1
+    # A wider window than the photo warrants over-smooths the baseline, so more of the surface
+    # reads as anomalous and the flagged blob grows well past the real object - the mechanism
+    # behind the oversized halos around light fixtures on small photos.
+    win = _res_odd(surface_mask.shape, 41, 9) if local_win is None else (local_win | 1)
     local_baseline = cv2.boxFilter(filled, -1, (win, win))
     spread = float(depth[present].std()) + 1e-6
 
@@ -542,7 +665,8 @@ def _depth_foreground_mask(
     # Anything's own map is coarse/blocky, so only a spatially coherent blob of real size is
     # trusted here; opening drops the noise, closing then restores a real blob's own interior
     # holes the opening step may have nicked.
-    anomaly_mask = cv2.morphologyEx(anomaly_mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+    noise_k = _res_odd(surface_mask.shape, 7, 3)
+    anomaly_mask = cv2.morphologyEx(anomaly_mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (noise_k, noise_k)))
     anomaly_mask = cv2.morphologyEx(anomaly_mask, cv2.MORPH_CLOSE, MORPH_KERNEL, iterations=2)
     return anomaly_mask
 
@@ -632,153 +756,296 @@ def _close(mask: np.ndarray, iterations: int = 2) -> np.ndarray:
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, MORPH_KERNEL, iterations=iterations)
 
 
-def _quads_from_mask(member: np.ndarray, bbox: tuple[int, int, int, int]) -> list | None:
-    """Fits one or more quads that together cover the mask, anchored to its true extent.
+# Assumed horizontal field of view for a room photo, in degrees. Needed because focal length is
+# what converts an angle into pixels, and a JPEG from an unknown camera doesn't carry it. Interior
+# and real-estate photos are shot wide; this only has to be close, since it affects the ratio of
+# across-the-room to into-the-room scale rather than the absolute size.
+ASSUMED_HFOV_DEG = 65.0
 
-    WebGL only ever paints inside a quad's rasterized geometry — a mask pixel that falls outside
-    every quad can never be painted, no matter how correct the mask itself is. A single trapezoid
-    fit from just the mask's top and bottom edges assumes the shape's width changes *linearly*
-    in between — true for a plain rectangular room's floor, false the moment the shape is more
-    complex (a narrow notch near a plant at one height, a wide stretch past a nightstand at a
-    similar height, on opposite sides of the frame). The linear interpolation between just those
-    two edges can badly underestimate the true width at every height in between, leaving a real,
-    correctly-detected stretch of the mask permanently outside the quad. Slicing the mask into
-    several horizontal bands and fitting each its own edge — sharing exact boundary coordinates
-    with its neighbor, so they still meet with zero gap between them, the same technique already
-    proven for the wall's corner planes — tracks the mask's actual shape instead of assuming it.
+
+# Floor-to-ceiling height of an ordinary interior, in metres. Used as a ruler to recover this
+# photo's focal length. It is a far tighter prior than field of view or camera height: most housing
+# sits between 2.4m and 2.7m, whereas the field of view of an unknown photo genuinely varies - on
+# this project's own test photos it measured anywhere from 47 to 66 degrees, so no single assumed
+# value can be right for all of them.
+TYPICAL_CEILING_HEIGHT_M = 2.5
+
+# The recovered field of view has to stay in the range real cameras occupy; outside it, the
+# measurement is describing something other than a wall between a floor and a ceiling.
+MIN_RECOVERED_HFOV_DEG, MAX_RECOVERED_HFOV_DEG = 35.0, 90.0
+
+# Columns of clean, unbroken wall needed before a focal length is trusted. Low enough to be
+# achievable on a real photo (furniture covers most of a wall's foot), high enough that a handful
+# of stray columns can't set the scale for the whole room.
+MIN_CEILING_CALIBRATION_COLUMNS = 15
+
+
+def _focal_from_ceiling(
+    outputs, depth_m: np.ndarray | None, size: tuple[int, int]
+) -> float | None:
+    """Recovers focal length in pixels by measuring a known real height in the photo.
+
+    Every metric size this file computes is a lateral distance, which is `depth / focal` — so
+    focal length sets the scale of all of them, and it cannot be recovered from geometry alone
+    (for any plane, inverse depth is affine in image coordinates whatever the focal length is).
+    Something of known real size has to appear in the photo. Floor-to-ceiling height is the best
+    candidate an interior offers: it is standardised to within a few percent across most housing,
+    and unlike camera height it is *visible*, so it can be measured rather than assumed.
+
+    Only columns where wall runs unbroken from the ceiling's lower edge to the floor's upper edge
+    are used — anywhere furniture, a door or a window interrupts it, the span is not a wall's full
+    height and would understate the focal length. Returns None when too few such columns exist,
+    which is common and not a failure: plenty of room photos never show the ceiling at all.
     """
-    min_y, min_x, max_y, max_x = bbox
-    full_width = max_x - min_x + 1
-    height = max_y - min_y + 1
-    min_edge_width = max(4, round(full_width * 0.15))
-
-    def row_extent(y):
-        row = member[y, min_x : max_x + 1]
-        nz = np.nonzero(row)[0]
-        if nz.size == 0:
-            return None
-        return int(nz[0]) + min_x, int(nz[-1]) + min_x
-
-    def extent_near(y, lo_bound, hi_bound):
-        # A quad edge with zero (or near-zero) width doesn't just look off, it can break the
-        # projective-transform math outright, so the whole region silently fails to render even
-        # though the mask is perfectly fine. Search outward from `y` in both directions — the
-        # true edge here may itself be a genuinely narrow sliver, same as at the mask's overall
-        # top/bottom — until the accumulated extent is wide enough to be a safe quad edge.
-        lo = hi = None
-        offset = 0
-        max_offset = max(hi_bound - y, y - lo_bound, 0)
-        while offset <= max_offset:
-            candidates = (y,) if offset == 0 else (y - offset, y + offset)
-            for yy in candidates:
-                if yy < lo_bound or yy > hi_bound:
-                    continue
-                ext = row_extent(yy)
-                if ext:
-                    lo = ext[0] if lo is None else min(lo, ext[0])
-                    hi = ext[1] if hi is None else max(hi, ext[1])
-            if lo is not None and (hi - lo) >= min_edge_width:
-                return lo, hi
-            offset += 1
-        if lo is None:
-            return None
-        # Last-resort safety net: the shape stayed narrow through the whole search window (a
-        # genuinely thin sliver, not just a thin starting point) — fall back to the full bbox
-        # width rather than ship an edge still thin enough to risk a broken transform.
-        return (min_x, max_x) if (hi - lo) < min_edge_width else (lo, hi)
-
-    sample_radius = max(6, round(height * 0.02))
-
-    def padded_extent(y: int, radius: int) -> tuple[float, float] | None:
-        lo_bound = max(min_y, y - radius)
-        hi_bound = min(max_y, y + radius)
-        ext = extent_near(y, lo_bound, hi_bound)
-        if ext is None:
-            return None
-        lo, hi = ext
-        # Padding each sampled edge outward is free: the fragment shader still discards anything
-        # outside the mask regardless of how generous the quad's own geometry is, so overshooting
-        # here can only ever recover real mask pixels a straight line would have missed, never
-        # paint anything the mask doesn't actually contain.
-        pad = max(20, round((hi - lo) * 0.14))
-        return max(min_x, lo - pad), min(max_x, hi + pad)
-
-    num_bands = max(1, min(9, round(height / max(1, full_width) * 6) + 3))
-    band_ys = sorted({min_y + round(i * (height - 1) / num_bands) for i in range(num_bands + 1)})
-    if len(band_ys) < 2:
+    if depth_m is None:
+        return None
+    ceiling = _mask_for_label(outputs, "ceiling", size)
+    floor = _mask_for_label(outputs, "floor", size)
+    wall = _mask_for_label(outputs, "wall", size)
+    if not (ceiling.any() and floor.any() and wall.any()):
         return None
 
-    extent = {}
-    for y in band_ys:
-        ext = padded_extent(y, height // num_bands)
-        if ext is None:
+    focals: list[float] = []
+    for x in range(size[0]):
+        cy = np.nonzero(ceiling[:, x])[0]
+        fy = np.nonzero(floor[:, x])[0]
+        if cy.size == 0 or fy.size == 0:
+            continue
+        top, bottom = int(cy.max()), int(fy.min())
+        if bottom - top < 20:
+            continue
+        # The span must actually be wall, not a bookcase or a window between the two.
+        if (wall[top:bottom, x] > 0).mean() < 0.75:
+            continue
+        z = float(np.median(depth_m[top:bottom, x]))
+        if not np.isfinite(z) or z <= 0.3:
+            continue
+        # height_m = span_px * z / focal  =>  focal = span_px * z / height_m
+        focals.append((bottom - top) * z / TYPICAL_CEILING_HEIGHT_M)
+
+    if len(focals) < MIN_CEILING_CALIBRATION_COLUMNS:
+        return None
+    focal = float(np.median(focals))
+    hfov = 2.0 * math.degrees(math.atan((size[0] / 2.0) / max(focal, 1e-6)))
+    if not (MIN_RECOVERED_HFOV_DEG <= hfov <= MAX_RECOVERED_HFOV_DEG):
+        return None
+    return focal
+
+
+METRIC_DEPTH_MODEL_NAME = "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf"
+
+
+@lru_cache(maxsize=1)
+def get_metric_depth_estimator():
+    return pipeline("depth-estimation", model=METRIC_DEPTH_MODEL_NAME, device=_torch_device())
+
+
+def _estimate_metric_depth(image: Image.Image, size: tuple[int, int]) -> np.ndarray | None:
+    """Per-pixel depth in **metres**, or None if the model is unavailable.
+
+    Separate from `_estimate_depth`, which returns the relative (unitless) map every corner-scoring
+    signal in this file is tuned against — that one stays exactly as it was. This one exists purely
+    to give tile scale a real unit, and metres are the whole point of it: a 600x600mm tile can only
+    be placed correctly if something in the pipeline knows how many metres of floor the photo
+    actually shows.
+    """
+    try:
+        estimator = get_metric_depth_estimator()
+    except Exception:  # noqa: BLE001 - a missing/unfetchable checkpoint must not fail an analysis
+        return None
+    out = estimator(image)
+    depth = out["predicted_depth"]
+    depth = depth.detach().to(torch.float32).cpu().numpy()
+    if depth.ndim == 3:
+        depth = depth[0]
+    if depth.shape[:2] != (size[1], size[0]):
+        depth = cv2.resize(depth, size, interpolation=cv2.INTER_LINEAR)
+    return depth
+
+
+def _plane_from_metric_depth(
+    mask: np.ndarray, depth_m: np.ndarray, size: tuple[int, int]
+) -> tuple[float, float, float, float] | None:
+    """Fits the surface's plane as inverse depth, returning (a, b, c, rms) with 1/Z ~= a*dx + b*dy + c.
+
+    For any plane in front of a pinhole camera, inverse depth is exactly affine in image
+    coordinates — substitute the back-projection into the plane equation and the depth falls out
+    linearly. So fitting a plane to a real surface reduces to a linear least squares on 1/Z, which
+    is both cheap and robust to the noise a monocular depth map carries.
+
+    Fitting inverse depth rather than depth itself matters: the far end of a floor spans a huge
+    range of Z for very few pixels, so a fit in Z is dominated by the distance nobody is looking at,
+    while a fit in 1/Z weights the near field where scale is well conditioned and visible.
+
+    `rms` is the fit's relative residual, and is the honest signal for whether this surface really
+    is one plane. A mask spanning two walls, or one dominated by an object the segmentation kept,
+    will not fit, and the caller must then decline to claim a physical size.
+    """
+    ys, xs = np.nonzero(mask)
+    if ys.size < 200:
+        return None
+    # A few thousand points settle a 3-parameter fit; the rest is cost for no precision.
+    if ys.size > 6000:
+        idx = np.linspace(0, ys.size - 1, 6000).astype(np.int64)
+        ys, xs = ys[idx], xs[idx]
+
+    z = depth_m[ys, xs].astype(np.float64)
+    ok = np.isfinite(z) & (z > 0.15)
+    if ok.sum() < 200:
+        return None
+    ys, xs, z = ys[ok], xs[ok], z[ok]
+
+    cx, cy = size[0] / 2.0, size[1] / 2.0
+    dx = xs.astype(np.float64) - cx
+    dy = ys.astype(np.float64) - cy
+    inv = 1.0 / z
+
+    A = np.column_stack([dx, dy, np.ones_like(dx)])
+    try:
+        coef, *_ = np.linalg.lstsq(A, inv, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    a, b, c = (float(v) for v in coef)
+    pred = A @ coef
+    denom = float(np.abs(inv).mean())
+    if denom <= 1e-9:
+        return None
+    rms = float(np.sqrt(np.mean((pred - inv) ** 2)) / denom)
+    return a, b, c, rms
+
+
+def _quad_world_size(
+    quad: list, plane: tuple[float, float, float, float], size: tuple[int, int], focal_px: float
+) -> tuple[float, float] | None:
+    """Real width and height, in metres, of the surface patch a quad covers.
+
+    Each corner is back-projected onto the fitted plane and measured in 3D. The depth of each
+    corner comes from the plane fit rather than the raw depth map on purpose: the corners sit on
+    the surface's outer boundary, exactly where a monocular depth map is least reliable (it bleeds
+    across edges), whereas the plane was fitted from the surface's whole interior.
+
+    Both opposite edges are measured and averaged. On a true plane they agree; where they disagree
+    the fit is describing something that is not one flat surface, and the disagreement is a cheap
+    check on that.
+    """
+    a, b, c, _rms = plane
+    cx, cy = size[0] / 2.0, size[1] / 2.0
+
+    pts = []
+    for x, y in quad:
+        inv_z = a * (x - cx) + b * (y - cy) + c
+        # Inverse depth at or below zero puts the point at or behind the horizon: the plane never
+        # reaches it, and no finite distance exists to measure.
+        if not np.isfinite(inv_z) or inv_z <= 1e-4:
             return None
-        extent[y] = ext
+        z = 1.0 / inv_z
+        if not (0.2 < z < 60.0):
+            return None
+        pts.append(np.array([z * (x - cx) / focal_px, z * (y - cy) / focal_px, z]))
 
-    # Between two sampled band boundaries, the quad edge as built so far is a *straight line*
-    # connecting their (already padded) extents — a real mask shape is free to bulge further out
-    # partway between those two samples (a real corner cut, a notch left by an excluded object,
-    # a sofa's own curve), and padding alone doesn't fix that: it's a fixed margin around each
-    # *sample*, not a bound on how far the true boundary can wander *between* samples. Whatever
-    # part of the mask still falls outside the resulting quad there is real, correctly-detected
-    # wall/floor area that WebGL then simply never paints — the render skips it outright, showing
-    # the bare, unpainted photo right at that seam, exactly like a corner cut or an object's edge
-    # would produce.
-    #
-    # Fixed instead of assumed away: actually check, at several rows between each pair of existing
-    # bands, whether the true (unpadded) row extent still fits inside the straight-line
-    # interpolation of the two padded edges either side of it. Wherever it doesn't — the real
-    # boundary bent away from that straight line by more than the padding already absorbs — insert
-    # a new band exactly at the worst such row and re-derive its own padded extent there, so the
-    # quad between each *new*, narrower pair of bands hugs the true shape far more closely. Capped
-    # so a pathologically jagged mask can't blow this up into hundreds of quads.
-    MAX_BANDS = 48
-    DEVIATION_TOLERANCE_PX = 2.0
-    CHECK_SAMPLES = 6
-    changed = True
-    while changed and len(band_ys) < MAX_BANDS:
-        changed = False
-        i = 0
-        while i < len(band_ys) - 1 and len(band_ys) < MAX_BANDS:
-            y0, y1 = band_ys[i], band_ys[i + 1]
-            gap = y1 - y0
-            if gap < 4:
-                i += 1
-                continue
-            lo0, hi0 = extent[y0]
-            lo1, hi1 = extent[y1]
-            worst_y = None
-            worst_dev = DEVIATION_TOLERANCE_PX
-            for k in range(1, CHECK_SAMPLES + 1):
-                t = k / (CHECK_SAMPLES + 1)
-                y = round(y0 + t * gap)
-                if y <= y0 or y >= y1:
-                    continue
-                actual = row_extent(y)
-                if actual is None:
-                    continue
-                a_lo, a_hi = actual
-                interp_lo = lo0 + (lo1 - lo0) * t
-                interp_hi = hi0 + (hi1 - hi0) * t
-                dev = max(interp_lo - a_lo, a_hi - interp_hi, 0.0)
-                if dev > worst_dev:
-                    worst_dev = dev
-                    worst_y = y
-            if worst_y is not None:
-                new_ext = padded_extent(worst_y, max(4, gap // 4))
-                if new_ext is not None:
-                    extent[worst_y] = new_ext
-                    band_ys.insert(i + 1, worst_y)
-                    changed = True
-            i += 1
+    tl, tr, br, bl = pts
+    top = float(np.linalg.norm(tr - tl))
+    bottom = float(np.linalg.norm(br - bl))
+    left = float(np.linalg.norm(bl - tl))
+    right = float(np.linalg.norm(br - tr))
 
-    quads = []
-    for i in range(len(band_ys) - 1):
-        y0, y1 = band_ys[i], band_ys[i + 1]
-        lo0, hi0 = extent[y0]
-        lo1, hi1 = extent[y1]
-        quads.append([(lo0, y0), (hi0, y0), (hi1, y1), (lo1, y1)])
-    return quads
+    width_m = (top + bottom) / 2.0
+    height_m = (left + right) / 2.0
+    if width_m <= 0.05 or height_m <= 0.05:
+        return None
+    # Opposite edges of a planar patch differ only through perspective, which the back-projection
+    # has already undone; a large residual difference means the plane is wrong for this quad.
+    for p, q in ((top, bottom), (left, right)):
+        lo, hi = min(p, q), max(p, q)
+        if lo <= 1e-6 or hi / lo > 2.5:
+            return None
+    return width_m, height_m
+
+
+# Plausible bounds on a real room, used to reject a geometry fit rather than render a wrong
+# physical scale. A visible floor narrower than ~1.2m or wider than ~12m across its near edge is
+# not a room this app is being pointed at; it is a failed fit.
+MAX_ROOM_WIDTH_M = 12.0
+MAX_ROOM_DEPTH_M = 15.0
+# How far a surface's inverse-depth fit may stray before it is not one flat plane.
+MAX_PLANE_FIT_RMS = 0.09
+
+
+def _quads_from_mask(member: np.ndarray, bbox: tuple[int, int, int, int]) -> list | None:
+    """Fits a single perspective quad to a floor mask, following the floor plane's own convergence.
+
+    This used to slice the mask into up to 48 horizontal bands and fit each its own quad. Every
+    band mapped the whole unit square, so the tile texture was rescaled to fit each band
+    individually — which cancels out exactly the effect perspective is supposed to produce. Tiles
+    came out roughly the same size at the back of the room as at the front, and the floor read as a
+    pattern pasted flat over the photo rather than a surface receding away from the camera. It is
+    the same mistake the wall had (one region per fragment, each warped separately), on the surface
+    where it matters most.
+
+    One quad fixes it without any extra machinery: `unitSquareToQuadHomography` is projective, not
+    affine, so mapping the unit square onto a converging trapezoid *is* the perspective foreshorten
+    — tiles shrink toward the narrow end on their own, continuously, with no seams to line up.
+
+    The bands existed for coverage, not perspective: WebGL only paints inside a quad's rasterized
+    geometry, so a mask pixel outside every quad can never be painted, and a trapezoid fitted only
+    to the mask's top and bottom rows can cut a bulge in between. That is handled here by fitting
+    each side and then pushing it outward until no row's true extent lies outside it. Overshooting
+    is free — the fragment shader discards anything outside the mask however generous the geometry
+    is — whereas undershooting loses real paintable floor, so the containment is one-directional.
+    """
+    min_y, min_x, max_y, max_x = bbox
+    height = max_y - min_y + 1
+    if height < 2:
+        return None
+
+    rows: list[tuple[int, int, int]] = []
+    for y in range(min_y, max_y + 1):
+        nz = np.nonzero(member[y, min_x : max_x + 1])[0]
+        if nz.size:
+            rows.append((y, int(nz[0]) + min_x, int(nz[-1]) + min_x))
+    if len(rows) < 2:
+        return None
+
+    ys = np.array([r[0] for r in rows], dtype=np.float64)
+    los = np.array([r[1] for r in rows], dtype=np.float64)
+    his = np.array([r[2] for r in rows], dtype=np.float64)
+
+    def fit_side(xs: np.ndarray, outward: int) -> tuple[float, float]:
+        """Least-squares line x = slope*y + intercept, then shifted `outward` until it contains
+        every row. The fit gives the side its real tilt (a floor's edge against the wall converges
+        with depth, and following that tilt is what makes the trapezoid a perspective one); the
+        shift guarantees containment even where furniture makes a row bulge past the trend."""
+        if np.ptp(ys) < 1e-6:
+            return 0.0, float(xs.mean())
+        slope, intercept = np.polyfit(ys, xs, 1)
+        residual = xs - (slope * ys + intercept)
+        # outward = -1 for the left side (contain the smallest x), +1 for the right.
+        intercept += residual.min() if outward < 0 else residual.max()
+        return float(slope), float(intercept)
+
+    left_slope, left_intercept = fit_side(los, -1)
+    right_slope, right_intercept = fit_side(his, +1)
+
+    top_y, bottom_y = float(min_y), float(max_y)
+
+    def side_x(slope: float, intercept: float, y: float) -> float:
+        return slope * y + intercept
+
+    x_tl = side_x(left_slope, left_intercept, top_y)
+    x_bl = side_x(left_slope, left_intercept, bottom_y)
+    x_tr = side_x(right_slope, right_intercept, top_y)
+    x_br = side_x(right_slope, right_intercept, bottom_y)
+
+    # A quad edge that is zero-width (or inverted, if the two fitted sides cross inside the mask's
+    # own row range) breaks the projective transform outright, and the whole surface then silently
+    # fails to render. The mask's bounding box is always a valid, if less flattering, fallback.
+    min_edge = max(4.0, (max_x - min_x + 1) * 0.05)
+    if (x_tr - x_tl) < min_edge or (x_br - x_bl) < min_edge:
+        return [
+            [(float(min_x), top_y), (float(max_x + 1), top_y), (float(max_x + 1), bottom_y), (float(min_x), bottom_y)]
+        ]
+
+    return [[(x_tl, top_y), (x_tr, top_y), (x_br, bottom_y), (x_bl, bottom_y)]]
 
 
 def _interior_anchor(member: np.ndarray) -> tuple[float, float]:
@@ -1407,75 +1674,61 @@ def _detect_horizontal_wall_corners(
     )
 
 
-def _split_mask_by_row_cuts(
-    mask: np.ndarray, cuts: list[tuple[float, float]], left_x: float, right_x: float
-) -> list[np.ndarray]:
-    """Row-axis counterpart of `_split_mask_by_cuts`, built the same way `_detect_horizontal_wall_corners`
-    finds its cuts: transpose, reuse the already-validated column-cut splitter unchanged, transpose
-    back. `cuts` are `(y_at_left, y_at_right)` pairs spanning from `left_x` to `right_x`."""
-    segments_t = _split_mask_by_cuts(np.ascontiguousarray(mask.T), cuts, left_x, right_x)
-    return [np.ascontiguousarray(seg.T) for seg in segments_t]
+def _subdivide_quad_horizontally(
+    quad: list, submask: np.ndarray, gray: np.ndarray, depth: np.ndarray | None
+) -> list:
+    """Subdivides one plane's quad into a stacked pair at a genuine horizontal architectural
+    corner — a soffit/bulkhead above a recessed wall, a chair rail — or returns it unchanged.
 
+    Only the *quad* is subdivided, never the surface. A horizontal plane change is real
+    information about how the tile texture has to be warped above versus below it, but it is not a
+    boundary between two things a user would want to design separately, and it never was: the wall
+    is one paintable surface (see `extract_wall_regions`). Splitting the region as well as the quad
+    is what used to turn one flat wall with a chair rail into two independently-selectable bands.
 
-def _split_region_horizontally(
-    region: dict, gray: np.ndarray, depth: np.ndarray | None, image_bgr: np.ndarray | None
-) -> list[dict]:
-    """Checks one already-finished wall region (post vertical-corner-splitting) for a genuine
-    horizontal architectural corner — a soffit, chair rail, or similar plane change — and splits
-    it top/bottom if `_detect_horizontal_wall_corners` finds one. Paint-color changes on a flat
-    plane are not corners and must not split the wall. Additive only: the region is untouched
-    unless there is independent geometric evidence of a horizontal corner. Scoped to a region with
-    a single simple quad; a region already built from several irregular bands is left alone.
+    Additive only: the quad is untouched unless there is independent geometric evidence of a
+    horizontal corner. `_detect_horizontal_wall_corners` runs with `require_shading=True`, so a
+    paint-color change on a flat plane — which is not a corner — cannot get this far.
     """
-    quads = region["quads"]
-    if len(quads) != 1:
-        return [region]
-    mask = region["mask"]
-    ys, xs = np.nonzero(mask)
+    ys, xs = np.nonzero(submask)
     if ys.size == 0:
-        return [region]
+        return [quad]
     top_y, left_x, bottom_y, right_x = int(ys.min()), int(xs.min()), int(ys.max()), int(xs.max())
     height, width = bottom_y - top_y + 1, right_x - left_x + 1
-    # Matches the lowered floor in `_detect_wall_corners`/`_detect_color_block_corners` — a narrow
-    # but real wall face (a nook's own return/side edge) still deserves a chance at its own
-    # molding split, not just the wide main wall faces either detector was originally sized around.
+    # Matches the lowered floor in `_detect_wall_corners` — a narrow but real wall face (a nook's
+    # own return/side edge) still deserves a chance at its own molding split, not just the wide
+    # main faces the detector was originally sized around.
     if height < 50 or width < 50:
-        return [region]
+        return [quad]
 
-    cuts = _detect_horizontal_wall_corners(gray, mask, depth=depth, max_corners=1)
+    cuts = _detect_horizontal_wall_corners(gray, submask, depth=depth, max_corners=1)
     if not cuts:
-        return [region]
+        return [quad]
     y_left, y_right = cuts[0]
 
-    all_cuts = [(float(top_y), float(top_y)), (y_left, y_right), (float(bottom_y + 1), float(bottom_y + 1))]
-    new_quads = [
-        [
-            (left_x, all_cuts[i][0]),
-            (right_x + 1, all_cuts[i][1]),
-            (right_x + 1, all_cuts[i + 1][1]),
-            (left_x, all_cuts[i + 1][0]),
-        ]
-        for i in range(2)
-    ]
-    submasks = _split_mask_by_row_cuts(mask, all_cuts, float(left_x), float(right_x + 1))
-
+    # A cut that leaves either band a sliver isn't a plane change worth re-warping for — the same
+    # "is this a real face or just an artifact at an object's edge" bar the vertical cuts use.
     min_band_height = max(15.0, height * 0.05)
+    if min(y_left, y_right) - top_y < min_band_height:
+        return [quad]
+    if bottom_y - max(y_left, y_right) < min_band_height:
+        return [quad]
 
-    def band_height(m: np.ndarray) -> float:
-        band_ys = np.nonzero(m)[0]
-        return float(band_ys.max() - band_ys.min() + 1) if band_ys.size else 0.0
+    # The quad's own left and right edges can be tilted (a vertical corner cut follows the real
+    # detected tilt rather than assuming the corner is plumb), so the cut's two endpoints have to
+    # ride *those* edges, interpolated at the cut's own height, rather than the submask's bounding
+    # box. Anchoring to the bbox instead would leave the upper and lower quad not quite sharing an
+    # edge, and a hairline of the bare photo would show through between them.
+    (x_tl, q_top), (x_tr, _), (x_br, q_bottom), (x_bl, _) = quad
+    span = max(q_bottom - q_top, 1e-6)
+    t_left = min(max((y_left - q_top) / span, 0.0), 1.0)
+    t_right = min(max((y_right - q_top) / span, 0.0), 1.0)
+    x_cut_left = x_tl + t_left * (x_bl - x_tl)
+    x_cut_right = x_tr + t_right * (x_br - x_tr)
 
-    if any(band_height(m) < min_band_height for m in submasks):
-        return [region]
-    if any(_largest_component_fraction(m) < MIN_SPLIT_SOLIDITY for m in submasks):
-        return [region]
-
-    new_regions = []
-    for q, m in zip(new_quads, submasks):
-        r = _region_from_member(m, quads=[q])
-        if r:
-            new_regions.append(r)
-    return new_regions if len(new_regions) == 2 else [region]
+    upper = [(x_tl, q_top), (x_tr, q_top), (x_cut_right, y_right), (x_cut_left, y_left)]
+    lower = [(x_cut_left, y_left), (x_cut_right, y_right), (x_br, q_bottom), (x_bl, q_bottom)]
+    return [upper, lower]
 
 
 SEAM_OVERLAP_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -1558,6 +1811,137 @@ def _grow_into_unclassified(mask: np.ndarray, occupied: np.ndarray, max_reach_px
     return grown
 
 
+def _denoise_wall_cluster(mask: np.ndarray) -> np.ndarray:
+    """Drops the pieces of one clustered wall mask that aren't real, paintable wall, and unions
+    whatever survives back into a single mask.
+
+    Both bars here predate the single-surface model and are unrelated to it — they ask whether a
+    piece is genuinely wall, not whether it deserves its own checkbox — so both have to keep
+    running now that the piece-per-region structure that used to host them is gone. Leaving them
+    out measurably let object contamination back up (the metric this project treats as
+    non-negotiable), because a sub-noise-floor fragment is overwhelmingly likely to be sitting in
+    exactly the cluttered, ambiguous part of the photo where a mask edge overlaps something real.
+
+    * Area: a component under `MIN_AREA_FRACTION` of the frame is noise — a thin reflection, a
+      stray misclassified patch — not a wall segment. This is a stricter floor than the one
+      `_cluster_wall_components` applies before grouping, deliberately: that one only rejects
+      what is obviously a stray pixel or two, since a piece too small to stand alone can still be
+      real evidence about which cluster its neighbours belong to.
+    * Shape: a *small* component whose mask is too scattered to read as one flat face — only
+      visible in the gaps around dense clutter — never looks like a real surface once painted, no
+      matter how its boundary is refined. See `_is_regular_wall_shape`, which is deliberately
+      inert on large components for exactly the reason its own docstring gives.
+    """
+    min_area_px = mask.size * MIN_AREA_FRACTION
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    kept = np.zeros_like(mask)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] < min_area_px:
+            continue
+        component = np.where(labels == i, mask, 0).astype(np.uint8)
+        if not _is_regular_wall_shape(component):
+            continue
+        kept = cv2.bitwise_or(kept, component)
+    return kept
+
+
+def _wall_plane_quads(
+    mask: np.ndarray,
+    gray: np.ndarray,
+    vp: tuple[float, float] | None,
+    depth: np.ndarray | None,
+    occupied: np.ndarray | None = None,
+) -> tuple[list, np.ndarray]:
+    """One clustered wall mask in; one perspective quad per real architectural plane out, plus the
+    cluster's own final (object-excluded) mask.
+
+    A detected corner is now *only* a statement about how the tile texture has to be warped, never
+    about where one selectable surface ends and the next begins — the whole wall is a single
+    surface a design applies to at once (see `extract_wall_regions`). That removes the reason the
+    previous version had to hold corners to a solidity bar: a corner used to also carve out a
+    separately-selectable region, so a cut whose two sides were each a scatter of islands produced
+    two visually interleaved, confusing selections, and rejecting the cut was the lesser evil. The
+    cost was real, though — that bar rejected genuine corners on any wall a piece of furniture
+    happened to break into islands, losing correct per-plane perspective on exactly the ordinary,
+    cluttered photos this app is used on. With one surface there is nothing left to interleave, so
+    the bar is gone and those corners are honoured again.
+
+    The sliver bars (width, area) stay: a bogus corner still warps the texture wrongly on both
+    sides of itself, and a cut that leaves a near-zero-width remainder is the signature of a
+    material change at an object's edge rather than a real plane change.
+    """
+    final_mask = _exclude_occupied(mask, occupied) if occupied is not None else mask
+    ys, xs = np.nonzero(mask)
+    if ys.size == 0:
+        return [], final_mask
+    min_y, min_x, max_y, max_x = int(ys.min()), int(xs.min()), int(ys.max()), int(xs.max())
+    top_y, bottom_y = float(min_y), float(max_y)
+
+    corners = _detect_wall_corners(gray, mask, vp=vp, depth=depth)
+
+    def build(cut_points: list[tuple[float, float]]) -> tuple[list, list]:
+        cuts = [(float(min_x), float(min_x)), *cut_points, (float(max_x + 1), float(max_x + 1))]
+        quads = [
+            [
+                (cuts[i][0], top_y),
+                (cuts[i + 1][0], top_y),
+                (cuts[i + 1][1], bottom_y),
+                (cuts[i][1], bottom_y),
+            ]
+            for i in range(len(cuts) - 1)
+        ]
+        return cuts, quads
+
+    # A resulting wall face narrower than this is suspicious on its own, regardless of how solid
+    # or well-scored the corner producing it was — real, separately-warped wall faces are rarely a
+    # sliver a few percent of the cluster's own width. Found in practice: a corner candidate right
+    # where a wall meets a curtain or other object scores exactly like a real corner (the
+    # shading/depth signals measure *any* consistent brightness/depth difference across the line,
+    # and a wall-to-fabric material change produces one just as reliably as a wall-to-wall plane
+    # change does). The one property that reliably separates the two: a real architectural face has
+    # real width; a material-change artifact at an object's own edge only ever leaves a thin,
+    # almost zero-width remainder between the object and the true cluster boundary.
+    min_wall_width_px = max(10.0, (max_x - min_x + 1) * 0.015)
+    min_wall_area_px = mask.size * (MIN_AREA_FRACTION * 0.5)
+
+    def submask_width(m: np.ndarray) -> float:
+        mxs = np.nonzero(m)[1]
+        return float(mxs.max() - mxs.min() + 1) if mxs.size else 0.0
+
+    def submask_area(m: np.ndarray) -> float:
+        return float((m > 0).sum())
+
+    def partition(cut_lines: list, quad_list: list) -> list[np.ndarray]:
+        if len(quad_list) <= 1:
+            return [mask]
+        return _split_mask_by_cuts(mask, cut_lines, top_y, bottom_y)
+
+    cuts, quads = build(corners)
+    submasks = partition(cuts, quads)
+
+    # Drop corners one at a time until every remaining cut leaves a wide-enough, big-enough face
+    # on both sides, or none are left and the cluster falls back to a single flat quad.
+    while corners and len(quads) > 1 and (
+        min(submask_width(m) for m in submasks) < min_wall_width_px
+        or min(submask_area(m) for m in submasks) < min_wall_area_px
+    ):
+        # The side failing worst (as a fraction of whichever bar it's failing) is the one most
+        # likely responsible — drop the corner adjacent to it rather than an arbitrary choice.
+        scores = [
+            min(submask_width(m) / min_wall_width_px, submask_area(m) / min_wall_area_px)
+            for m in submasks
+        ]
+        worst_side = min(range(len(scores)), key=lambda i: scores[i])
+        del corners[max(0, min(worst_side, len(corners) - 1))]
+        cuts, quads = build(corners)
+        submasks = partition(cuts, quads)
+
+    out: list = []
+    for quad, submask in zip(quads, submasks):
+        out.extend(_subdivide_quad_horizontally(quad, submask, gray, depth))
+    return out, final_mask
+
+
 def extract_wall_regions(
     wall_mask: np.ndarray,
     occupied: np.ndarray,
@@ -1566,8 +1950,31 @@ def extract_wall_regions(
     depth: np.ndarray | None = None,
     floor_mask: np.ndarray | None = None,
     occupied_for_splitting: np.ndarray | None = None,
-    image_bgr: np.ndarray | None = None,
 ) -> list[dict]:
+    """Every wall in the photo as **one** paintable surface, carrying one perspective quad per
+    real architectural plane inside it.
+
+    This used to return a region per wall face, per disconnected fragment, per corner cut and per
+    horizontal band, each needing its own selection before it could be designed — so an ordinary
+    cluttered room came back as a scatter of checkboxes over what a person sees as a single wall,
+    and covering that wall meant tapping every one of them and picking the same design each time.
+    Nothing about the *geometry* required that: `DetectedRegion.quads` is a list precisely because
+    one surface can span several planes, and the renderer already draws one warp per quad against
+    the region's shared mask. So the corner pipeline still runs, and still decides where the warp
+    changes; it just no longer decides how many things there are to select.
+
+    Two consequences worth naming, both deliberate:
+
+    * Walls separated by a real gap (a doorway, an open window, genuine open space) come back in
+      this same one surface. They are still clustered separately — that matters, so a large real
+      gap can't get bridged by corner detection's own bbox math — and each cluster still gets its
+      own quads. They simply share one design, which is what a single surface means.
+    * `meanIntensity` is now measured across the whole wall rather than per face. The shader
+      divides each pixel's own luminance by it, so a corner's two faces no longer each normalise
+      to their own average — their real brightness difference survives into the render (bounded by
+      the shader's own clamp) instead of being flattened away, which is what keeps a corner
+      reading as a corner.
+    """
     if occupied_for_splitting is None:
         occupied_for_splitting = occupied
 
@@ -1614,127 +2021,36 @@ def extract_wall_regions(
     # more afterward — an item on the wall must stay excluded even after straightening.
     mask = _smooth_mask_contours(mask, epsilon_frac=0.006)
     mask = _exclude_occupied(mask, occupied_for_splitting)
-    # A single flat perspective quad across a real corner would warp the tile pattern as if both
-    # wall faces were one flat plane, which looks wrong right at the bend — and a real corner is
-    # also exactly where a user wants to put two different designs on two different wall faces.
-    # Detect any real corners within this mask and cut both the quads *and* the mask itself at
-    # the same lines, so each wall face becomes its own independently selectable/designable
-    # region. Every cut's edges are shared, coordinate-for-coordinate, with its neighbor's — the
-    # quads by construction, the submasks via `_split_mask_by_cuts` using those same cut
-    # lines — so adjacent wall pieces still meet exactly, with no visible gap between them.
-    # A single "wall" mask can genuinely contain more than one real, physically separate wall —
-    # two walls with an open window, a doorway, or open space between them, not a corner bending
-    # one continuous surface. Treating the whole thing as one bounding box let a large real gap
-    # like that get bridged right through by corner-detection's own bbox math, and a scatter of
-    # small, unrelated fragments near a glass partition or reflection get folded in as if they
-    # were evidence about the *same* wall the main mass belongs to — exactly the kind of noisy,
-    # inconsistent corner it kept finding there. Clustering first, and running corner-detection on
-    # each real cluster independently, is what actually fixes that instead of tuning around it.
-    regions: list[dict] = []
+
+    # Clustering still happens, and still happens *before* corner detection: a single "wall" mask
+    # can genuinely contain more than one real, physically separate wall (two walls with an open
+    # window, a doorway, or open space between them, not a corner bending one continuous surface).
+    # Treating the whole thing as one bounding box let a large real gap like that get bridged right
+    # through by corner-detection's own bbox math, and let a scatter of small, unrelated fragments
+    # near a glass partition or reflection be folded in as if they were evidence about the *same*
+    # wall the main mass belongs to. What changed is only what comes out the other side: each
+    # cluster contributes its quads and its pixels to one shared surface instead of becoming its
+    # own separately-selectable region.
+    quads: list = []
+    combined = np.zeros_like(mask)
     for cluster_mask in _cluster_wall_components(mask):
-        regions.extend(
-            _extract_wall_regions_from_cluster(
-                cluster_mask, gray, vp=vp, depth=depth, occupied=occupied, image_bgr=image_bgr
-            )
+        # Noise and non-surface pieces still get dropped rather than painted — that filtering was
+        # never about how many things there were to select, so it has to survive the move to one
+        # surface. See `_denoise_wall_cluster`.
+        cluster_mask = _denoise_wall_cluster(cluster_mask)
+        if not cluster_mask.any():
+            continue
+        cluster_quads, cluster_final = _wall_plane_quads(
+            cluster_mask, gray, vp=vp, depth=depth, occupied=occupied
         )
-    regions = [r for r in regions if _is_regular_wall_shape(r["mask"])]
-    # Additive only (see `_split_region_horizontally`): the vertical-corner pipeline above only
-    # ever looks for left/right splits, so a real horizontal architectural line — a soffit above a
-    # recessed wall, a chair rail — never gets a chance to split anything on its own axis. Run here,
-    # before both merge passes below, so each merge sees the same per-cluster region shapes the
-    # vertical pipeline actually produced — running it after either merge changes a region's shape
-    # (by combining it with a same-column or small-fragment neighbor first) enough to sometimes
-    # miss a real horizontal corner that's plainly there beforehand. Each resulting piece is tagged
-    # `_no_occlusion_merge` so the two merge passes below — both built to re-join pieces occlusion
-    # pulled apart — leave it alone rather than silently re-joining a deliberate split.
-    horizontally_split: list[dict] = []
-    for region in regions:
-        split = _split_region_horizontally(region, gray, depth, image_bgr)
-        if len(split) > 1:
-            for r in split:
-                r["_no_occlusion_merge"] = True
-        horizontally_split.extend(split)
-    regions = horizontally_split
-    # Deliberately a final pass over every *fully resolved* region, not something folded into the
-    # recursive splitting above: a piece occluded by furniture in the middle of a column (a plant,
-    # a floor lamp) frequently only becomes its own distinct shape *after* corner-cutting has
-    # already run — the upper part of the column is often still topologically connected to the
-    # rest of the wall near the ceiling, only separating out once a real corner cuts it away from
-    # its neighbor, while the lower part was already its own disconnected piece from the start.
-    # Those two never exist as siblings to compare at any single point during the recursion; only
-    # here, once every region this wall mask will ever produce actually exists, can they be.
-    regions = _merge_same_column_regions(regions)
+        if not cluster_quads or not cluster_final.any():
+            continue
+        quads.extend(cluster_quads)
+        combined = cv2.bitwise_or(combined, cluster_final)
 
-    # A last, coarse "is this actually worth its own checkbox" bar — separate from every earlier
-    # noise/shape filter, which all ask whether a region is *real* wall, not whether it's *useful*
-    # as an independent selection target. A genuine sliver of wall only visible in the gap between
-    # a nightstand's legs is real, correctly detected, and still a bad standalone checkbox: no user
-    # taps "select" specifically for that. Measured directly against four real, varied photos:
-    # every legitimate independent wall face came out at 2.1% of the frame or larger, while the one
-    # furniture-gap sliver found in practice measured 0.41% — a 5x gap with room on both sides, not
-    # a value tuned to force one specific case.
-    #
-    # A below-bar region is *merged into its nearest larger neighbor*, not dropped — dropping it
-    # was tried first and was wrong: it's real, visible wall, and simply discarding it left a
-    # real hole a user could see and would never expect (paint stopping short of the wall visible
-    # between a nightstand's legs is exactly as wrong as painting over the nightstand itself, just
-    # in the opposite direction). Folding it into whichever larger region is spatially closest —
-    # almost always the one it's actually a fragment of, just cut off by the furniture in front of
-    # it — keeps it paintable through that region's own checkbox instead of needing one of its own.
-    WALL_MIN_STANDALONE_FRACTION = 0.01
-    total_px = mask.size
-
-    def region_area_frac(r: dict) -> float:
-        return (r["mask"] > 0).sum() / total_px
-
-    def region_center(r: dict) -> tuple[float, float]:
-        ys, xs = np.nonzero(r["mask"])
-        return float(xs.mean()), float(ys.mean())
-
-    # A region tagged by `_split_region_horizontally` is a deliberate split — a real molding strip
-    # above a narrow return/side wall face can legitimately be a small fraction of the *whole*
-    # frame even though it's a solid, obviously-separate surface, so it's exempt from this
-    # generic "too small to bother with, fold into whatever's nearest" absorption regardless of
-    # its own area fraction.
-    small_ids = {
-        id(r)
-        for r in regions
-        if region_area_frac(r) < WALL_MIN_STANDALONE_FRACTION and not r.get("_no_occlusion_merge")
-    }
-    small = [r for r in regions if id(r) in small_ids]
-    large = [r for r in regions if id(r) not in small_ids]
-    if not small:
-        final_regions = large
-    elif not large:
-        # Nothing bigger to fold into — keep every region as-is rather than losing real,
-        # independently-visible wall area entirely just because none of it individually clears
-        # the standalone-checkbox bar.
-        final_regions = regions
-    else:
-        large_masks = [r["mask"] for r in large]
-        large_centers = [region_center(r) for r in large]
-        for r in small:
-            cx, cy = region_center(r)
-            nearest = min(
-                range(len(large_centers)),
-                key=lambda i: (large_centers[i][0] - cx) ** 2 + (large_centers[i][1] - cy) ** 2,
-            )
-            large_masks[nearest] = cv2.bitwise_or(large_masks[nearest], r["mask"])
-        merged = [_region_from_member(m) for m in large_masks]
-        final_regions = [r for r in merged if r]
-
-    # Additive only (see `_split_region_horizontally`): the vertical-corner pipeline above only
-    # ever looks for left/right splits, so a real horizontal architectural line — a soffit above a
-    # recessed wall, a chair rail — never gets a chance to split anything on its own axis.
-    # Deliberately the true last step in this function, after both merges above — a molding strip
-    # above a narrow return/side wall face can legitimately be a small fraction of the *whole*
-    # frame even though it's a real, solid, obviously-separate surface; running this before the
-    # small-region absorption above let that absorption fold it right back into its neighbor,
-    # silently undoing a genuine split the moment after this created it.
-    horizontally_split: list[dict] = []
-    for region in final_regions:
-        horizontally_split.extend(_split_region_horizontally(region, gray, depth, image_bgr))
-    return horizontally_split
+    if not quads or not combined.any():
+        return []
+    return [{"quads": quads, "centroid": _interior_anchor(combined), "mask": combined}]
 
 
 # Minimum "extent" (mask area / its own bounding-box area) a *small* wall region must have to be
@@ -1827,297 +2143,6 @@ def _largest_component_fraction(mask: np.ndarray) -> float:
     return largest / total
 
 
-def _split_disconnected(mask: np.ndarray, min_area_px: float) -> list[np.ndarray]:
-    """Splits `mask` into one mask per connected component with at least `min_area_px` pixels,
-    dropping smaller pieces outright as noise (the same per-piece noise floor
-    `_cluster_wall_components` already applies before its own proximity grouping)."""
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    out = []
-    for i in range(1, n):
-        if stats[i, cv2.CC_STAT_AREA] < min_area_px:
-            continue
-        out.append(np.where(labels == i, mask, 0).astype(np.uint8))
-    return out
-
-
-# How much two disconnected pieces' x-ranges have to overlap, as a fraction of the *narrower*
-# piece's own width, before they're candidates for being the same wall column. Deliberately not
-# sufficient on its own — see `_merge_same_column_components` for why a piece occluded by tall
-# furniture also has to be a *similar width* to, and *vertically disjoint* from, the piece it's
-# merging into; x-overlap alone is trivially satisfied by a small fragment sitting anywhere inside
-# a wide wall's own x-range, which is not the same thing as being a continuation of a narrow column.
-SAME_COLUMN_OVERLAP_FRACTION = 0.6
-# The two pieces' widths must be within this ratio of each other. A real occluded-column pair (the
-# same physical wall strip, interrupted by furniture) is close to the same width above and below;
-# a small fragment merging into an entire wide wall spanning most of the photo is a completely
-# different shape relationship and must not qualify no matter how much its x-range overlaps.
-SAME_COLUMN_WIDTH_RATIO = 2.0
-# The two pieces' y-ranges must be genuinely disjoint (one ends, a gap, the other begins) rather
-# than overlapping — a piece occluded by furniture in the middle of a column is only ever
-# *interrupted*, not nested inside the other piece's own height. The gap itself is allowed to be
-# fairly generous (a tall plant, a floor lamp) but is capped relative to the pieces' own height so
-# it can't bridge two things that just happen to be far apart vertically.
-SAME_COLUMN_MAX_GAP_RATIO = 0.6
-# A hairline y-gap (a few pixels) is what a horizontal architectural cut looks like after the
-# mask is partitioned — merging those two bands back together silently undoes a real soffit/chair-
-# rail split. Furniture occlusion leaves a much larger hole (a plant, a floor lamp). This floor
-# is the difference between those two cases.
-SAME_COLUMN_MIN_GAP_RATIO = 0.15
-
-
-def _merge_same_column_components(components: list[np.ndarray]) -> list[np.ndarray]:
-    """Merges disconnected pieces that are plausibly the same wall column, interrupted by an
-    occluding object, back into one region.
-
-    `_split_disconnected` exists to stop a stray fragment in unrelated clutter from silently
-    dragging along whatever else happens to share its cluster (see the wall-behind-a-glass-case
-    case that motivated it) — but it can't distinguish that from a much more ordinary situation:
-    one continuous flat wall with a tall piece of furniture (a plant, a floor lamp) standing in
-    front of the middle of it, breaking the mask into a piece above and a piece below with nothing
-    in between. Both pieces are obviously "the same wall" to a user — one checkbox, one design —
-    and treating them as two forces someone to select and assign the same design twice for no
-    reason.
-
-    x-range overlap alone isn't enough to tell that situation apart from a small, unrelated
-    fragment that just happens to sit somewhere inside a much wider wall's own x-range (an earlier
-    version of this function merged exactly that, folding a tiny nightstand-area sliver into the
-    entire main wall it had no real relationship to) — so this also requires the two pieces to be a
-    similar *width* and to be vertically *disjoint* with only a modest gap, both real properties of
-    "the same narrow column, interrupted," that a small stray fragment inside a big wall doesn't have.
-    """
-    if len(components) <= 1:
-        return components
-
-    def bounds(m: np.ndarray) -> tuple[int, int, int, int]:
-        ys, xs = np.nonzero(m)
-        return int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())
-
-    ranges = [bounds(m) for m in components]
-
-    def same_column(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
-        x0a, x1a, y0a, y1a = a
-        x0b, x1b, y0b, y1b = b
-        width_a, width_b = x1a - x0a + 1, x1b - x0b + 1
-        if max(width_a, width_b) / min(width_a, width_b) > SAME_COLUMN_WIDTH_RATIO:
-            return False
-        x_overlap = min(x1a, x1b) - max(x0a, x0b)
-        if x_overlap / min(width_a, width_b) < SAME_COLUMN_OVERLAP_FRACTION:
-            return False
-        # Disjoint check: one range must end before the other begins (a real gap), not overlap.
-        gap = max(y0a, y0b) - min(y1a, y1b)
-        if gap <= 0:
-            return False
-        shorter = min(y1a - y0a + 1, y1b - y0b + 1)
-        if gap < SAME_COLUMN_MIN_GAP_RATIO * shorter:
-            return False
-        max_gap = SAME_COLUMN_MAX_GAP_RATIO * shorter
-        return gap <= max_gap
-
-    merged: list[np.ndarray] = []
-    used = [False] * len(components)
-    for i in range(len(components)):
-        if used[i]:
-            continue
-        group_mask = components[i]
-        group_bounds = ranges[i]
-        used[i] = True
-        changed = True
-        while changed:
-            changed = False
-            for j in range(len(components)):
-                if used[j]:
-                    continue
-                if same_column(group_bounds, ranges[j]):
-                    group_mask = cv2.bitwise_or(group_mask, components[j])
-                    x0a, x1a, y0a, y1a = group_bounds
-                    x0b, x1b, y0b, y1b = ranges[j]
-                    group_bounds = (min(x0a, x0b), max(x1a, x1b), min(y0a, y0b), max(y1a, y1b))
-                    used[j] = True
-                    changed = True
-        merged.append(group_mask)
-    return merged
-
-
-def _merge_same_column_regions(regions: list[dict]) -> list[dict]:
-    """Applies `_merge_same_column_components` across a wall mask's *fully resolved* final
-    regions — after every cluster split and every corner cut has already happened, not during
-    either. A piece occluded by furniture in the middle of a column can easily still be
-    topologically joined to the rest of the wall near the ceiling at cluster-split time, only
-    becoming its own distinct shape once a real corner cuts it away from its neighbor deep inside
-    the recursion — so the piece above the obstruction and the piece below it may never exist as
-    siblings at any single point during that recursion to compare directly. They always both exist
-    by the time every region this wall mask will ever produce has been built, which is exactly
-    when this runs.
-    """
-    if len(regions) <= 1:
-        return regions
-    # A region tagged by `_split_region_horizontally` is a deliberate split, not an occlusion
-    # fragment — this function's whole job is undoing the latter, so it never even sees the
-    # former: pulled out before merging, added back unchanged after.
-    protected = [r for r in regions if r.get("_no_occlusion_merge")]
-    mergeable = [r for r in regions if not r.get("_no_occlusion_merge")]
-    if len(mergeable) <= 1:
-        return regions
-    merged_masks = _merge_same_column_components([r["mask"] for r in mergeable])
-    if len(merged_masks) == len(mergeable):
-        return regions
-    out = list(protected)
-    for m in merged_masks:
-        region = _region_from_member(m)
-        if region:
-            out.append(region)
-    return out
-
-
-# How solid each side of a corner split must stay to trust that split. A real architectural corner
-# divides a wall into two faces that are each still one solid piece. Right around clutter a plain
-# flat wall doesn't have — a glass display case, open shelving, a TV nook — the wall is only
-# visible in scattered slivers on both sides of where the cut line falls, and an x-position-only
-# split (see `_split_mask_by_cuts`) then hands each side a handful of unrelated islands rather than
-# one coherent face. Selecting either resulting "wall" in that case visibly grabs fragments that
-# look, to the user, like they belong to the other one — the two regions read as bleeding into each
-# other even though the split is numerically exact. Below this bar, the corner is discarded and the
-# whole cluster stays one region instead, which is a clean single selection rather than two
-# confusing, interleaved ones.
-MIN_SPLIT_SOLIDITY = 0.75
-
-
-def _extract_wall_regions_from_cluster(
-    mask: np.ndarray,
-    gray: np.ndarray,
-    vp: tuple[float, float] | None,
-    depth: np.ndarray | None,
-    occupied: np.ndarray | None = None,
-    image_bgr: np.ndarray | None = None,
-) -> list[dict]:
-    """Corner-detects and builds region(s) for one already-clustered, single-wall mask — see
-    `extract_wall_regions` for why clustering has to happen before this, not inside it."""
-    # `mask` arrives already grouped by proximity (`_cluster_wall_components`), but everything
-    # since then — contour simplification, subtracting a real excluded object (a TV, an open
-    # shelving unit, a light fixture) that sits across a connecting strip, or falling back to one
-    # big bounding quad when a corner split below gets discarded — can still pinch what was one
-    # bridged blob at cluster-time into several disconnected pieces by the time this runs. Whether
-    # two such pieces are still close in *pixels* turns out not to be a reliable stand-in for
-    # whether they still read as the *same visible surface*: a small piece can end up brushing the
-    # main mass at one lone corner while sitting, visually, in obviously different clutter (behind
-    # an open shelf, around a light fixture) — merging it in there paints a stray-looking patch,
-    # while simply dropping it throws away real, paintable wall area for no reason. Splitting each
-    # such piece into its *own* independently selectable region — recursing so each still gets its
-    # own corner-detection pass — does neither: every real visible patch stays available to design,
-    # and none of them silently drags another one's disconnected fragment along with it.
-    # The full noise floor (not `_cluster_wall_components`'s more lenient pre-merge one) — a piece
-    # only reaches this point after already surviving that earlier, laxer filter and then getting
-    # cut off from its cluster's main mass, so what's being decided here is "is this genuinely big
-    # enough to stand alone as its own selectable wall", a stricter question than "is this obviously
-    # just a stray pixel or two of noise".
-    min_area_px = mask.size * MIN_AREA_FRACTION
-    components = _split_disconnected(mask, min_area_px)
-    if len(components) != 1:
-        regions = []
-        for component in components:
-            regions.extend(
-                _extract_wall_regions_from_cluster(
-                    component, gray, vp=vp, depth=depth, occupied=occupied, image_bgr=image_bgr
-                )
-            )
-        return regions
-    mask = components[0]
-
-    ys, xs = np.nonzero(mask)
-    bbox = (int(ys.min()), int(xs.min()), int(ys.max()), int(xs.max()))
-    top_y, bottom_y = float(bbox[0]), float(bbox[2])
-    corners = _detect_wall_corners(gray, mask, vp=vp, depth=depth)
-
-    def build(cut_points: list[tuple[float, float]]) -> tuple[list, list]:
-        cuts = [(float(bbox[1]), float(bbox[1])), *cut_points, (float(bbox[3] + 1), float(bbox[3] + 1))]
-        quads = [
-            [
-                (cuts[i][0], top_y),
-                (cuts[i + 1][0], top_y),
-                (cuts[i + 1][1], bottom_y),
-                (cuts[i][1], bottom_y),
-            ]
-            for i in range(len(cuts) - 1)
-        ]
-        return cuts, quads
-
-    cuts, quads = build(corners)
-
-    if len(quads) == 1:
-        final_mask = _exclude_occupied(mask, occupied) if occupied is not None else mask
-        region = _region_from_member(final_mask, quads=quads)
-        return [region] if region else []
-
-    submasks = _split_mask_by_cuts(mask, cuts, top_y, bottom_y)
-
-    # A resulting wall face narrower than this is suspicious on its own, regardless of how solid
-    # or well-scored the corner producing it was — real, useful, separately-paintable wall faces
-    # are rarely a sliver a few percent of the cluster's own width. Found in practice: a corner
-    # candidate right where a wall meets a curtain or other object scores exactly like a real
-    # corner (`score()`'s shading/depth signals measure *any* consistent brightness/depth
-    # difference across the line, and a wall-to-fabric material change produces one just as
-    # reliably as a wall-to-wall plane change does) — nothing in that scoring distinguishes the
-    # two. The one property that reliably does: a real architectural face has real width; a
-    # material-change artifact right at an object's own edge only ever produces a thin, almost
-    # zero-width remainder between the object and the true cluster boundary.
-    min_wall_width_px = max(10.0, (bbox[3] - bbox[1] + 1) * 0.015)
-    # Same "is this genuinely big enough to stand alone" bar `_split_disconnected` already applies
-    # to a whole disconnected piece, now applied to a corner-cut *submask* too — a corner can pass
-    # both the solidity and width checks above and still slice off a sliver too small in total
-    # area to be a meaningfully separate, useful checkbox (found in practice: two ~45px-wide but
-    # only ~65px-tall slivers next to a nightstand, from a corner that was real evidence but not a
-    # face worth its own separate selection). Better as one small combined region than two
-    # near-invisible ones each demanding their own tap.
-    min_wall_area_px = mask.size * (MIN_AREA_FRACTION * 0.5)
-
-    def submask_width(m: np.ndarray) -> float:
-        xs = np.nonzero(m)[1]
-        return float(xs.max() - xs.min() + 1) if xs.size else 0.0
-
-    def submask_area(m: np.ndarray) -> float:
-        return float((m > 0).sum())
-
-    # Drop corners one at a time until every remaining cut produces solid, wide-enough, big-enough
-    # pieces on both sides, or none are left and the cluster falls back to a single flat region.
-    def worst_offender(subs: list[np.ndarray]) -> int:
-        scores = [
-            min(
-                _largest_component_fraction(m) / MIN_SPLIT_SOLIDITY,
-                submask_width(m) / min_wall_width_px,
-                submask_area(m) / min_wall_area_px,
-            )
-            for m in subs
-        ]
-        return min(range(len(scores)), key=lambda i: scores[i])
-
-    while corners and (
-        min(_largest_component_fraction(m) for m in submasks) < MIN_SPLIT_SOLIDITY
-        or min(submask_width(m) for m in submasks) < min_wall_width_px
-        or min(submask_area(m) for m in submasks) < min_wall_area_px
-    ):
-        # The side that's failing worst (as a fraction of whichever bar it's failing) is the one
-        # most likely responsible — drop the corner adjacent to it rather than an arbitrary choice.
-        worst_side = worst_offender(submasks)
-        corner_idx = max(0, min(worst_side, len(corners) - 1))
-        del corners[corner_idx]
-        cuts, quads = build(corners)
-        if len(quads) == 1:
-            break
-        submasks = _split_mask_by_cuts(mask, cuts, top_y, bottom_y)
-
-    if len(quads) == 1:
-        final_mask = _exclude_occupied(mask, occupied) if occupied is not None else mask
-        region = _region_from_member(final_mask, quads=quads)
-        return [region] if region else []
-
-    regions = []
-    for quad, submask in zip(quads, submasks):
-        final_submask = _exclude_occupied(submask, occupied) if occupied is not None else submask
-        region = _region_from_member(final_submask, quads=[quad])
-        if region:
-            regions.append(region)
-    return regions
-
 
 def extract_floor_region(floor_mask: np.ndarray, occupied: np.ndarray) -> list[dict]:
     # The floor is one continuous surface even when furniture occludes parts of it — treat
@@ -2187,10 +2212,18 @@ def analyze_image(image_bytes: bytes, target_width: int, target_height: int, deb
     # doesn't differ) and the room's vertical vanishing point (a real architectural vertical
     # points at it; a decorative line usually only coincidentally shares its rough angle).
     depth = _estimate_depth(image, analysis_size)
+    # A second, metric depth pass, in metres. Deliberately separate from `depth` above, which every
+    # corner-scoring signal in this file is tuned against as a unitless relative map — this one only
+    # ever feeds tile scale, so detection behaves identically whether or not it is available.
+    depth_metric = _estimate_metric_depth(image, analysis_size)
     vp = _estimate_vertical_vanishing_point(gray)
 
     segmenter = get_segmenter()
-    outputs, extra_probs = _segment(image, segmenter, extra_prob_labels=("floor",))
+    outputs, extra_probs = _segment(
+        image,
+        segmenter,
+        extra_prob_labels=("floor",) + UNDER_DETECTED_AGAINST_WALL,
+    )
     floor_prob = extra_probs["floor"]
 
     # A rug/carpet sits directly on the floor and isn't its own separate real object the way
@@ -2220,12 +2253,12 @@ def analyze_image(image_bytes: bytes, target_width: int, target_height: int, deb
     raw_floor_mask = floor_mask.copy() if debug else None
 
     # Refine the initial floor mask with guided filter to snap perfectly to baseboard/wall junctions
-    floor_mask = _guided_filter_refine(floor_mask, gray, r=8, eps=0.015)
+    floor_mask = _guided_filter_refine(floor_mask, gray, r=_res_px(gray.shape, 8), eps=0.015)
 
     wall_mask = _mask_for_label(outputs, "wall", analysis_size)
     raw_wall_mask = wall_mask.copy() if debug else None
     # Refine the initial wall mask with guided filter to snap perfectly to ceiling/floor junctions and columns
-    wall_mask = _guided_filter_refine(wall_mask, gray, r=8, eps=0.015)
+    wall_mask = _guided_filter_refine(wall_mask, gray, r=_res_px(gray.shape, 8), eps=0.015)
 
     # A depth-guided second refinement pass was tried here (and for the floor mask above) to snap
     # same-color-but-different-depth boundaries the color guide alone can't see. In practice it did
@@ -2255,17 +2288,38 @@ def analyze_image(image_bytes: bytes, target_width: int, target_height: int, deb
     # itself textured/patterned almost by definition — so anything the model already calls "rug"
     # is exempted before the result is used, regardless of how much local variance it has.
     rug_raw = _mask_for_label(outputs, "rug", analysis_size)
-    floor_objects = _detect_textured_objects(gray, floor_mask)
-    floor_objects = cv2.bitwise_and(floor_objects, cv2.bitwise_not(rug_raw))
-    floor_depth_fg = cv2.bitwise_and(_depth_foreground_mask(floor_mask, depth), cv2.bitwise_not(rug_raw))
-    floor_objects = cv2.bitwise_or(floor_objects, floor_depth_fg)
+    floor_raised = _depth_foreground_mask(floor_mask, depth)
+    floor_depth_fg = cv2.bitwise_and(floor_raised, cv2.bitwise_not(rug_raw))
+    # High local texture means something different on a floor than it does on a wall, and treating
+    # it the same was carving holes out of rugs. A painted wall is uniform, so a textured patch on
+    # one is almost certainly a distinct object. A floor is not: a patterned rug is textured by
+    # definition, and it is exactly what this app is supposed to paint over. The `rug` label alone
+    # is not enough of an exemption either — it only covers the pixels the model actually named
+    # "rug", so the parts of a real rug it named "floor" (or nothing) still got flagged, leaving a
+    # rug painted in patches with its border showing through. Visible directly in a test photo,
+    # and precisely what a good visualizer does not do.
+    #
+    # Depth is the signal that separates the two cases: a real object sitting on the floor rises
+    # off the floor plane, and a rug lying flat on it does not. So texture may still define an
+    # object's shape here, but no longer decides on its own that there is one.
+    floor_textured = cv2.bitwise_and(_detect_textured_objects(gray, floor_mask), cv2.bitwise_not(rug_raw))
+    floor_textured = _components_corroborated_by(floor_textured, floor_raised)
+    floor_objects = cv2.bitwise_or(floor_textured, floor_depth_fg)
     floor_mask = _exclude_occupied(floor_mask, floor_objects)
 
     # Where "looking through a window" is actually allowed to happen: a real windowpane, plus a
     # modest margin around it for the sliver of frame/sill right at its edge — not the whole
     # image. See `_occupied_mask` for why this can't just be a blanket exclusion everywhere.
     window_raw = _mask_for_label(outputs, "windowpane", analysis_size)
-    near_window = cv2.dilate(window_raw, MORPH_KERNEL, iterations=6) if window_raw.any() else window_raw
+    # Pure outward growth, so its size lands directly on the painted boundary - unlike the
+    # close/open pairs elsewhere, which are boundary-neutral. 6 iterations of a 9x9 kernel is
+    # ~27px: a reasonable sliver of frame on a 1600px analysis image, but 5% of the width of a
+    # 547px one, which is what left a thick unpainted band around every window and curtain.
+    near_window = (
+        cv2.dilate(window_raw, MORPH_KERNEL, iterations=_res_px(gray.shape, 6))
+        if window_raw.any()
+        else window_raw
+    )
 
     # Each surface's growth must stop at the *other* surface's real boundary too, not just at
     # unrelated objects — otherwise floor could bleed up onto the wall and vice versa.
@@ -2291,14 +2345,15 @@ def analyze_image(image_bytes: bytes, target_width: int, target_height: int, deb
     # several separately-excluded thin legs with real paintable floor between. r=1 is the largest
     # radius that doesn't bridge a gap that narrow while still refining the coarser, larger cutout
     # boundaries (a couch, a table) it primarily exists for.
-    floor_occupied = _guided_filter_refine(floor_occupied, gray, r=1, eps=0.01)
+    floor_occupied = _guided_filter_refine(floor_occupied, gray, r=_res_px(gray.shape, 1), eps=0.01)
     # A conservative 1px safety margin around every excluded object: right at a real object's
     # true edge, the guide-filtered cutout can still leave a sliver of anti-aliased/blended pixels
     # that read as "surface" by a hair. Optimizing for "never recolor an object" over "recolor
     # every possible surface pixel" means that thin, genuinely ambiguous fringe should stay
     # protected rather than painted — one pixel is cheap and costs no real, unambiguous surface
     # area anywhere else.
-    floor_occupied = cv2.dilate(floor_occupied, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    safety_k = _res_odd(gray.shape, 3)
+    floor_occupied = cv2.dilate(floor_occupied, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (safety_k, safety_k)))
 
     # wall_occupied is the full mask of everything that is not wall (e.g. TV, pictures, furniture),
     # subtracted from final wall regions so we never paint over TV screens or other wall decor.
@@ -2311,8 +2366,8 @@ def analyze_image(image_bytes: bytes, target_width: int, target_height: int, deb
     # like a couch or TV) blurs a boundary that thin away entirely, and refining an *upscaled copy
     # of an already-blurred-away boundary* later can't recover detail smoothed out at this stage.
     wall_occupied_sharp = wall_occupied.copy()
-    wall_occupied = _guided_filter_refine(wall_occupied, gray, r=6, eps=0.01)
-    wall_occupied = cv2.dilate(wall_occupied, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    wall_occupied = _guided_filter_refine(wall_occupied, gray, r=_res_px(gray.shape, 6), eps=0.01)
+    wall_occupied = cv2.dilate(wall_occupied, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (safety_k, safety_k)))
 
     # wall_occupied_for_splitting excludes flat wall-mounted or wall-obscuring objects (like TVs,
     # pictures, posters, mirrors) so the wall mask is kept solid and contiguous for the growth and
@@ -2325,14 +2380,67 @@ def analyze_image(image_bytes: bytes, target_width: int, target_height: int, deb
         image_bgr
     )
     wall_occupied_for_splitting = cv2.bitwise_or(wall_occupied_for_splitting, wall_objects)
-    wall_occupied_for_splitting = _guided_filter_refine(wall_occupied_for_splitting, gray, r=6, eps=0.01)
-    wall_occupied_for_splitting = cv2.dilate(wall_occupied_for_splitting, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    wall_occupied_for_splitting = _guided_filter_refine(wall_occupied_for_splitting, gray, r=_res_px(gray.shape, 6), eps=0.01)
+    wall_occupied_for_splitting = cv2.dilate(
+        wall_occupied_for_splitting, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (safety_k, safety_k))
+    )
 
     floor_regions = extract_floor_region(floor_mask, floor_occupied)
     wall_regions = extract_wall_regions(
         wall_mask, wall_occupied, gray, vp=vp, depth=depth, floor_mask=floor_mask,
-        occupied_for_splitting=wall_occupied_for_splitting, image_bgr=image_bgr
+        occupied_for_splitting=wall_occupied_for_splitting
     )
+
+    # Half-detected objects, removed from the finished surface rather than from its inputs.
+    #
+    # Placement here is the whole point, and was learned the hard way. Folding this into
+    # `wall_objects` before extraction - the obvious place - measurably increased the number of
+    # object pixels the render paints over, because removing area upstream reshapes the mask that
+    # `_grow_into_unclassified` then expands from, and a 240px growth budget re-routed into real
+    # objects somewhere else entirely. Subtracting from the finished regions changes no earlier
+    # decision: growth, splitting and corner detection all see exactly what they saw before, so
+    # the only possible effect is that fewer pixels get painted.
+    #
+    # That also makes the change safe by construction rather than by measurement. The painted set
+    # can only shrink, and a subset cannot intersect the object mask more than its superset did -
+    # so this cannot paint over anything it did not already paint over.
+    def under_detected_mask(labels: tuple[str, ...]) -> np.ndarray:
+        found = np.zeros(analysis_size[::-1], dtype=np.uint8)
+        for label in labels:
+            prob = extra_probs.get(label)
+            if prob is None:
+                continue
+            confident = _mask_for_label(outputs, label, analysis_size)
+            if not confident.any():
+                continue
+            found = cv2.bitwise_or(
+                found, _grow_class_by_hysteresis(confident, prob, HYSTERESIS_WEAK_THRESHOLD)
+            )
+        return found
+
+    def trim_regions(regions: list[dict], remove: np.ndarray) -> list[dict]:
+        if not remove.any():
+            return regions
+        trimmed = []
+        for region in regions:
+            mask_after = _exclude_occupied(region["mask"], remove)
+            # A surface trimmed below the noise floor was mostly the object to begin with.
+            if mask_after.sum() / 255 < mask_after.size * MIN_AREA_FRACTION:
+                continue
+            trimmed.append(
+                {
+                    "quads": region["quads"],
+                    "mask": mask_after,
+                    # The anchor has to be recomputed: the old one can now sit in the hole this
+                    # just punched, and it is what the selection hotspot is placed on.
+                    "centroid": _interior_anchor(mask_after),
+                }
+            )
+        # Never trim a surface out of existence — if nothing survives, the detection was wrong
+        # about the objects rather than right about the surface.
+        return trimmed or regions
+
+    wall_regions = trim_regions(wall_regions, under_detected_mask(UNDER_DETECTED_AGAINST_WALL))
 
     # The room photo is rendered on screen at its own true resolution (often much bigger than
     # 1600px on a modern phone photo), but every mask above was computed at the capped
@@ -2434,6 +2542,25 @@ def analyze_image(image_bytes: bytes, target_width: int, target_height: int, deb
             if occupied_encoded is not None:
                 mask_to_encode = _exclude_occupied(mask_to_encode, occupied_encoded)
 
+        # Anti-alias the finished binary shape by exactly the magnification the resize introduced.
+        # Every classification decision above ran at `analysis_size`, so a boundary that is one
+        # jagged pixel *there* arrives here as an `encode_scale`-pixel staircase — and the `> 127`
+        # re-threshold right after the cubic resize above is what makes that staircase visible in
+        # the render, since it throws away the soft coverage ramp the interpolation had already
+        # produced. It has to throw it away: every step between it and here (contour smoothing,
+        # re-excluding a real object) is a bitwise operation that needs a clean binary shape. So
+        # the ramp gets rebuilt here instead, once the shape is final, by blurring the edge by the
+        # same factor it was just stretched by — which turns each of those steps back into the
+        # sub-pixel coverage fraction it actually represents. It cannot move the boundary: a
+        # symmetric blur of a straight edge leaves the 0.5 crossing exactly where it was.
+        #
+        # Runs unconditionally, floored at a 3px kernel, rather than only when a resize happened:
+        # a photo at or under the analysis cap has no magnified staircase, but it still has the
+        # model's own one-pixel jaggedness, and a hard binary edge on that reads just as sharply
+        # cut out. One pixel of feather is what a rendered edge needs to stop looking stencilled.
+        aa_radius = max(1, int(round(encode_scale)))
+        mask_to_encode = cv2.GaussianBlur(mask_to_encode, (aa_radius * 2 + 1,) * 2, 0)
+
         if encode_guide_gray is not None and encode_guide_gray.shape[:2] == mask_to_encode.shape[:2]:
             # r=3 here is deliberately small relative to `_guided_filter_refine`'s own r=6-8 — this
             # pass only feathers the edge the binary shape above already decided on, not re-derive
@@ -2474,10 +2601,70 @@ def analyze_image(image_bytes: bytes, target_width: int, target_height: int, deb
             "meanIntensity": mean_intensity,
         }
 
+    # The horizon is estimated in analysis-resolution coordinates (that is where the floor quad
+    # was fitted), so it has to be scaled into the same target-image space the quads are reported
+    # in, or the client would place the vanishing line at the wrong height and every tile would be
+    # the wrong size.
+    # Real size of the patch each quad covers, measured from metric depth.
+    #
+    # This replaces estimating a horizon from where the floor mask's left and right edges converge.
+    # That was fragile for a specific and unavoidable reason: wherever a floor runs off the side of
+    # the frame, its boundary there is the image border, a vertical line carrying no perspective
+    # information at all. Fitting it produced a horizon 418px above the top of a 431px image on one
+    # of this project's own test photos, and it had to refuse on five of six. Fitting a plane to
+    # dense metric depth over the surface's whole interior uses far more evidence and does not rely
+    # on the mask's silhouette being the room's true edges.
+    #
+    # Focal length is still assumed (ASSUMED_HFOV_DEG) and cannot be recovered here: for any plane,
+    # inverse depth is affine in image coordinates whatever the focal length is, so a plane fit
+    # carries no information about it. What metric depth does remove is the assumed camera height,
+    # and with it the guesswork in the depth direction, which is now measured outright.
+    # Measured from the photo where a ceiling makes that possible, assumed only where it doesn't.
+    focal_px = _focal_from_ceiling(outputs, depth_metric, analysis_size)
+    if focal_px is None:
+        focal_px = (analysis_size[0] / 2.0) / math.tan(math.radians(ASSUMED_HFOV_DEG / 2.0))
+
+    # An interior wall is between roughly 2.1m and 3.2m floor to ceiling. A measured face taller
+    # than this bound is not a room with high ceilings, it is the plane fit or the assumed field of
+    # view being wrong for that surface — measured 3.4m on rooms that plainly are not. A face may
+    # legitimately be *short* (furniture cuts it off), so only the upper bound is a rejection.
+    MAX_WALL_FACE_HEIGHT_M = 3.3
+
+    def world_quads(region: dict, kind: str) -> list | None:
+        if depth_metric is None:
+            return None
+        out = []
+        for quad in region["quads"]:
+            # A plane per quad, not per region. A wall is one *surface* for selection purposes but
+            # several real planes — one per architectural face — and asking a single plane fit to
+            # describe two walls meeting at a corner is asking it to describe a fold. It cannot, so
+            # the residual check rejected it and every wall fell back to an assumed size. Each
+            # quad, by construction, covers exactly one face; restricting the fit to the surface
+            # pixels inside that quad is what makes the fit meaningful.
+            cell = np.zeros_like(region["mask"])
+            cv2.fillConvexPoly(cell, np.array(quad, dtype=np.int32), 255)
+            cell = cv2.bitwise_and(cell, region["mask"])
+            plane = _plane_from_metric_depth(cell, depth_metric, analysis_size)
+            if plane is None or plane[3] > MAX_PLANE_FIT_RMS:
+                return None
+            wh = _quad_world_size(quad, plane, analysis_size, focal_px)
+            if wh is None:
+                return None
+            w_m, h_m = wh
+            if not (0.12 <= w_m <= MAX_ROOM_WIDTH_M) or not (0.08 <= h_m <= MAX_ROOM_DEPTH_M):
+                return None
+            if kind == "wall" and h_m > MAX_WALL_FACE_HEIGHT_M:
+                return None
+            out.append({"widthM": round(w_m, 4), "heightM": round(h_m, 4)})
+        return out
+
     result = {
         "floor": [encode(r, "floor", i) for i, r in enumerate(floor_regions)],
         "wall": [encode(r, "wall", i) for i, r in enumerate(wall_regions)],
     }
+    for kind, region_list in (("floor", floor_regions), ("wall", wall_regions)):
+        for payload, region in zip(result[kind], region_list):
+            payload["worldQuads"] = world_quads(region, kind)
     if debug:
         result["debug"] = _build_debug_bundle(
             image=np.array(image),

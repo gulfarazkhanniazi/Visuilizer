@@ -12,6 +12,7 @@ interface AnalyzeRegion {
   maskWidth: number;
   maskHeight: number;
   meanIntensity: number;
+  worldQuads: { widthM: number; heightM: number }[] | null;
 }
 
 interface AnalyzeResponse {
@@ -45,6 +46,7 @@ async function toDetectedRegion(kind: "floor" | "wall", r: AnalyzeRegion): Promi
     kind,
     quads,
     centroid,
+    worldQuads: r.worldQuads ?? null,
     maskData,
     maskWidth: r.maskWidth,
     maskHeight: r.maskHeight,

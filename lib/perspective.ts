@@ -22,6 +22,7 @@ uniform vec2 uRepeat;
 uniform vec2 uOffset;
 uniform float uMeanIntensity;
 uniform float uShadingStrength;
+uniform vec2 uShadingRange;
 out vec4 outColor;
 void main() {
   vec2 tileUv = vUnit * uRepeat + uOffset;
@@ -43,11 +44,13 @@ void main() {
   // local intensity relative to region's average intensity
   float shading = roomIntensity / max(uMeanIntensity, 0.05);
 
-  // Keep shading within a narrow band: enough to read as a real highlight/shadow (and to keep an
-  // actual architectural corner visually distinct from the flat plane next to it) without letting
-  // a dark shadow or a blown-out window highlight crush the design toward black/white — that reads
-  // as "recolored by the original wall," not as a solid design lit naturally.
-  shading = clamp(shading, 0.75, 1.3);
+  // Bounded so a blown-out window highlight or a near-black shadow can't crush the design toward
+  // white/black — that reads as "recolored by the original surface" rather than as a real material
+  // lit naturally. The bound is per-surface (uShadingRange) rather than one figure for both,
+  // because the two surfaces fail in opposite directions: a floor's realism lives almost entirely
+  // in the contact shadows under furniture, while a wall mostly needs its corners to stay distinct
+  // without picking up whatever colour cast the old paint had.
+  shading = clamp(shading, uShadingRange.x, uShadingRange.y);
 
   // Apply shading strength blend
   shading = mix(1.0, shading, uShadingStrength);
@@ -70,9 +73,42 @@ const PHOTO_FRAGMENT_SRC = `#version 300 es
 precision highp float;
 in vec2 vUv;
 uniform sampler2D uRoom;
+uniform vec2 uRoomTexSize;
+uniform float uBicubic;
 out vec4 outColor;
+
+// Catmull-Rom. Chosen over the B-spline cubic that most "textureBicubic" snippets implement,
+// because that one is *blurrier* than bilinear - it is a smoothing filter. Catmull-Rom
+// interpolates through the samples and slightly overshoots at edges, which is what makes a
+// magnified photo read as sharp rather than soft.
+float crWeight(float x) {
+  x = abs(x);
+  if (x < 1.0) return 1.5 * x * x * x - 2.5 * x * x + 1.0;
+  if (x < 2.0) return -0.5 * x * x * x + 2.5 * x * x - 4.0 * x + 2.0;
+  return 0.0;
+}
+
+vec4 sampleCatmullRom(sampler2D tex, vec2 uv, vec2 texSize) {
+  vec2 coord = uv * texSize - 0.5;
+  vec2 base = floor(coord);
+  vec2 f = coord - base;
+  vec4 acc = vec4(0.0);
+  float wsum = 0.0;
+  for (int j = -1; j <= 2; ++j) {
+    for (int i = -1; i <= 2; ++i) {
+      float w = crWeight(float(i) - f.x) * crWeight(float(j) - f.y);
+      vec2 p = (base + vec2(float(i), float(j)) + 0.5) / texSize;
+      acc += texture(tex, p) * w;
+      wsum += w;
+    }
+  }
+  return acc / max(wsum, 1e-5);
+}
+
 void main() {
-  outColor = texture(uRoom, vUv);
+  // Only when the photo is being magnified. Minifying wants the mipmap chain instead, and 16 taps
+  // of a reconstruction filter would just be a slower way to alias.
+  outColor = uBicubic > 0.5 ? sampleCatmullRom(uRoom, vUv, uRoomTexSize) : texture(uRoom, vUv);
 }
 `;
 
@@ -153,6 +189,10 @@ export interface RenderRegion {
   offsetX: number;
   offsetY: number;
   meanIntensity: number;
+  /** How much of the photo's own light and shadow to carry into the design, 0-1. */
+  shadingStrength: number;
+  /** Lower/upper bound on that shading, as a multiplier of the surface's mean brightness. */
+  shadingRange: [number, number];
 }
 
 export class RoomCompositor {
@@ -164,6 +204,9 @@ export class RoomCompositor {
   private roomTexture: WebGLTexture | null = null;
   private imgWidth = 0;
   private imgHeight = 0;
+  /** The photo texture's own pixel size, which is the source's, not the canvas'. */
+  private roomTexWidth = 0;
+  private roomTexHeight = 0;
 
   constructor(private canvas: HTMLCanvasElement) {
     const gl = canvas.getContext("webgl2", { preserveDrawingBuffer: true });
@@ -195,18 +238,46 @@ export class RoomCompositor {
     return { width: this.imgWidth, height: this.imgHeight };
   }
 
-  setRoomImage(image: HTMLImageElement | HTMLCanvasElement | ImageBitmap, width: number, height: number) {
+  /**
+   * `width`/`height` stay the photo's own pixel space, because that is the space every quad and
+   * mask is expressed in. `renderWidth`/`renderHeight` size the drawing buffer independently.
+   *
+   * They used to be the same thing, which quietly capped output quality at the source photo's
+   * resolution: a 547px-wide stock photo produced a 547px-wide canvas that CSS then stretched to
+   * ~890px on screen, so the browser upscaled the finished render and softened every tile edge
+   * and grout line in it. The photo itself can't gain detail it never had, but the tile texture is
+   * full-resolution art being minified into that small buffer, and the mask is delivered at up to
+   * 2600px - so both have real detail to spend on a bigger buffer. Rendering at display size
+   * instead of source size is what lets the design read as crisp material rather than a blur.
+   */
+  setRoomImage(
+    image: HTMLImageElement | HTMLCanvasElement | ImageBitmap,
+    width: number,
+    height: number,
+    renderWidth?: number,
+    renderHeight?: number,
+  ) {
     const gl = this.gl;
     this.imgWidth = width;
     this.imgHeight = height;
-    this.canvas.width = width;
-    this.canvas.height = height;
+    this.canvas.width = Math.max(1, Math.round(renderWidth ?? width));
+    this.canvas.height = Math.max(1, Math.round(renderHeight ?? height));
+
+    // The source's own pixel size — a photo can be far larger or smaller than either the canvas
+    // or the coordinate space the masks use, and the sampler needs the real texel grid.
+    this.roomTexWidth =
+      (image as HTMLImageElement).naturalWidth || (image as HTMLCanvasElement).width || width;
+    this.roomTexHeight =
+      (image as HTMLImageElement).naturalHeight || (image as HTMLCanvasElement).height || height;
 
     if (!this.roomTexture) this.roomTexture = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, this.roomTexture);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    // Mipmaps so a photo larger than the canvas is minified by averaging rather than by point
+    // sampling every nth texel, which is what made a big phone photo shimmer along fine detail.
+    gl.generateMipmap(gl.TEXTURE_2D);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
@@ -262,6 +333,14 @@ export class RoomCompositor {
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, this.roomTexture);
       gl.uniform1i(gl.getUniformLocation(this.photoProgram, "uRoom"), 0);
+      gl.uniform2f(
+        gl.getUniformLocation(this.photoProgram, "uRoomTexSize"),
+        this.roomTexWidth,
+        this.roomTexHeight,
+      );
+      // Bicubic only pays off when magnifying; below 1:1 the mipmap chain is the right filter.
+      const magnifying = this.roomTexWidth > 0 && this.canvas.width > this.roomTexWidth;
+      gl.uniform1f(gl.getUniformLocation(this.photoProgram, "uBicubic"), magnifying ? 1 : 0);
       gl.drawArrays(gl.TRIANGLE_FAN, 0, 4);
     }
 
@@ -279,6 +358,7 @@ export class RoomCompositor {
     const roomResLoc = gl.getUniformLocation(this.regionProgram, "uRoomResolution");
     const meanIntensityLoc = gl.getUniformLocation(this.regionProgram, "uMeanIntensity");
     const shadingStrengthLoc = gl.getUniformLocation(this.regionProgram, "uShadingStrength");
+    const shadingRangeLoc = gl.getUniformLocation(this.regionProgram, "uShadingRange");
     gl.uniform2f(roomResLoc, this.canvas.width, this.canvas.height);
 
     for (const region of regions) {
@@ -288,11 +368,10 @@ export class RoomCompositor {
       gl.uniform2f(repeatLoc, region.repeatX, region.repeatY);
       gl.uniform2f(offsetLoc, region.offsetX, region.offsetY);
       gl.uniform1f(meanIntensityLoc, region.meanIntensity);
-      // A little natural light/shadow is kept (see the fragment shader's tightened clamp) so a
-      // real architectural corner still reads visually distinct — full solid-color flatness here
-      // would make an adjoining plane painted with the same design blend into one continuous
-      // surface, hiding the room's actual geometry.
-      gl.uniform1f(shadingStrengthLoc, 0.3);
+      // Set per surface by the caller — a floor and a wall need very different amounts of the
+      // photo's original light carried through. See `SHADING` in RoomCanvas.
+      gl.uniform1f(shadingStrengthLoc, region.shadingStrength);
+      gl.uniform2f(shadingRangeLoc, region.shadingRange[0], region.shadingRange[1]);
 
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, region.texture);
