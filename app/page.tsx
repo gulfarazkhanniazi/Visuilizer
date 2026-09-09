@@ -36,8 +36,8 @@ export default function Home() {
   const [catalog, setCatalog] = useState<CatalogItem[]>([]);
   const [catalogError, setCatalogError] = useState<string | null>(null);
 
-  useEffect(() => {
-    fetchCatalog()
+  const loadCatalog = useCallback((opts?: { force?: boolean }) => {
+    fetchCatalog(opts)
       .then((items) => {
         setCatalog(items);
         // Warm the image cache so applying a design feels instant instead of waiting on a fetch.
@@ -47,6 +47,10 @@ export default function Home() {
       })
       .catch((err) => setCatalogError(err instanceof Error ? err.message : "Failed to load designs."));
   }, []);
+
+  useEffect(() => {
+    loadCatalog();
+  }, [loadCatalog]);
 
   const runDetection = useCallback(async (file: File) => {
     setPendingFile(file);
@@ -105,6 +109,10 @@ export default function Home() {
     setRegions({ floor: [], wall: [] });
     setSelectedIds(new Set());
     setAssignments({});
+    // Starting a fresh session is the natural point a user expects a design they just added (or
+    // moved between folders) to show up — bypass the in-memory catalog cache here rather than
+    // requiring a full page reload for it to appear (see `fetchCatalog`'s own doc comment).
+    loadCatalog({ force: true });
   };
 
   const toggleSelect = (id: string) =>

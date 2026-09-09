@@ -10,6 +10,23 @@ import { ErrorBanner } from "./ErrorBanner";
 
 const DENSITY = { floor: 10, wall: 6 } as const;
 
+// The hotspot's own fixed h-9/w-9 size in px (see `Hotspot` below). Used only to keep the
+// displayed circle fully inside the container's visible, `overflow-hidden` bounds; it never touches
+// the region's real centroid or any coordinate the backend/WebGL side actually uses.
+const HOTSPOT_SIZE_PX = 36;
+
+/** Clamps a 0-1 position fraction so a `sizePx`-wide/tall element centered there (via the same
+ * -translate-1/2 the hotspot itself uses) never extends past the edge of a `containerPx`-sized
+ * box — a no-op for any position already comfortably inside, which is every hotspot that isn't
+ * within half its own size of an edge. Falls back to the raw fraction when the container hasn't
+ * been measured yet or is smaller than the hotspot itself (degenerate layout), rather than
+ * clamping against a bogus margin that could push the hotspot the wrong way. */
+function clampHotspotFraction(fraction: number, containerPx: number, sizePx: number): number {
+  if (!containerPx || containerPx <= sizePx) return fraction;
+  const marginFrac = sizePx / 2 / containerPx;
+  return Math.min(Math.max(fraction, marginFrac), 1 - marginFrac);
+}
+
 interface RoomCanvasProps {
   image: HTMLImageElement;
   imgWidth: number;
@@ -82,11 +99,30 @@ export function RoomCanvas({
   catalog,
 }: RoomCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
   const compositorRef = useRef<RoomCompositor | null>(null);
   const textureCacheRef = useRef<Map<string, WebGLTexture>>(new Map());
   const maskCacheRef = useRef<Map<string, WebGLTexture>>(new Map());
   const [renderError, setRenderError] = useState<string | null>(null);
   const [showOriginal, setShowOriginal] = useState(false);
+  // The hotspot layer positions itself as a percentage of this container's own rendered CSS box
+  // (same box the canvas fills via `inset-0 h-full w-full`) — never the WebGL drawing buffer,
+  // which is fixed at the source photo's resolution and can be a completely different size (see
+  // `RoomCompositor.setRoomImage`). Tracked live via ResizeObserver since that CSS size changes
+  // with the viewport (desktop vs. mobile, window resizing) while the underlying image/region
+  // coordinates never do.
+  const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect;
+      setContainerSize({ width, height });
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
 
   // No separate surface toggle — every detected floor and wall part gets its own hotspot on the
   // image at once, and tapping one is both "make it visible/selected" and the design target.
@@ -98,6 +134,16 @@ export function RoomCanvas({
       const compositor = new RoomCompositor(canvasRef.current);
       compositor.setRoomImage(image, imgWidth, imgHeight);
       compositorRef.current = compositor;
+      // `region.id` is only unique *within* one photo's analysis (vision.py names them
+      // deterministically, e.g. "floor-0") — it repeats across different photos. The mask-texture
+      // cache below is keyed by that id and never expires an entry on its own, so if this
+      // component instance ever renders a second photo (a new `image`) without unmounting, its
+      // "floor-0" would silently reuse the *previous* photo's cached texture instead of building
+      // a new one from the current `floorRegions`/`wallRegions` — a real photo showing a stale
+      // mask from an old analysis. Tying the cache's lifetime to `image` identity, not to how long
+      // the component happens to stay mounted, is what makes a new photo always get a fresh cache.
+      for (const tex of maskCacheRef.current.values()) compositor.deleteTexture(tex);
+      maskCacheRef.current.clear();
     } catch (err) {
       const message =
         err instanceof Error
@@ -137,6 +183,16 @@ export function RoomCanvas({
     }
 
     async function draw() {
+      // Sized to the container's real CSS display size (times devicePixelRatio), not the source
+      // photo's own resolution — a small stock photo displayed at a much wider layout width would
+      // otherwise leave the browser to upscale a low-res raster via plain CSS image scaling,
+      // blurring every edge in the process, including a mask boundary's subtle anti-aliased
+      // feather (see `resizeDrawingBuffer`'s own doc comment). A no-op once already at the right
+      // size, so this costs nothing on every other render.
+      if (containerSize.width > 0 && containerSize.height > 0) {
+        compositor!.resizeDrawingBuffer(containerSize.width, containerSize.height, window.devicePixelRatio || 1);
+      }
+
       if (showOriginal) {
         if (!cancelled) compositor!.render([]);
         return;
@@ -192,7 +248,7 @@ export function RoomCanvas({
     return () => {
       cancelled = true;
     };
-  }, [floorRegions, wallRegions, assignments, showOriginal, catalog]);
+  }, [floorRegions, wallRegions, assignments, showOriginal, catalog, containerSize]);
 
   const handleDownload = () => {
     const compositor = compositorRef.current;
@@ -250,6 +306,7 @@ export function RoomCanvas({
       </div>
 
       <div
+        ref={containerRef}
         className="relative w-full overflow-hidden rounded-2xl bg-zinc-900"
         style={{ aspectRatio: `${imgWidth} / ${imgHeight}` }}
       >
@@ -259,8 +316,8 @@ export function RoomCanvas({
           activeRegions.map((region) => (
             <Hotspot
               key={region.id}
-              x={region.centroid.x / imgWidth}
-              y={region.centroid.y / imgHeight}
+              x={clampHotspotFraction(region.centroid.x / imgWidth, containerSize.width, HOTSPOT_SIZE_PX)}
+              y={clampHotspotFraction(region.centroid.y / imgHeight, containerSize.height, HOTSPOT_SIZE_PX)}
               selected={selectedIds.has(region.id)}
               onClick={() => onToggleSelect(region.id)}
             />

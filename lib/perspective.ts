@@ -199,8 +199,18 @@ export class RoomCompositor {
     const gl = this.gl;
     this.imgWidth = width;
     this.imgHeight = height;
-    this.canvas.width = width;
-    this.canvas.height = height;
+    // The drawing-buffer resolution (canvas.width/height) is *not* tied to the photo's own pixel
+    // dimensions here — only initialized to it as a reasonable default before the container has
+    // been measured. `resizeDrawingBuffer` (called once the CSS layout size is known, and again on
+    // every resize) is what actually sets it going forward. See that method for why: a small
+    // source photo displayed at a much wider CSS width forces the *browser* to upscale the
+    // finished raster if the buffer stays photo-sized, blurring every edge in the process —
+    // including a mask boundary's already-subtle anti-aliased feather, which is what turns a
+    // few-pixel soft edge into a visibly hazy "gap" around furniture once magnified.
+    if (this.canvas.width === 0 || this.canvas.height === 0) {
+      this.canvas.width = width;
+      this.canvas.height = height;
+    }
 
     if (!this.roomTexture) this.roomTexture = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, this.roomTexture);
@@ -210,6 +220,27 @@ export class RoomCompositor {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+
+  /** Sets the actual WebGL drawing-buffer resolution — independent of `imgWidth`/`imgHeight`
+   * (the photo's own coordinate space that every quad/NDC computation is defined in, untouched by
+   * this). Every fragment-shader calculation here (roomUv, mask sampling) is already resolution-
+   * independent, normalized UV math, so rendering at a higher buffer resolution than the source
+   * photo doesn't need any of that to change — it just gives WebGL's own (correctly anti-aliased)
+   * texture sampling more real pixels to resolve each mask/tile boundary into, instead of leaving
+   * a low-resolution raster for the browser to blur afterward via plain CSS image scaling. Capped
+   * to a sane maximum (a real device pixel ratio on a wide monitor can otherwise ask for a
+   * multi-thousand-pixel buffer for a single room photo) and only takes effect on a real size
+   * change, so it doesn't reallocate the drawing buffer (which clears it) on every render. */
+  resizeDrawingBuffer(cssWidth: number, cssHeight: number, devicePixelRatio: number) {
+    if (cssWidth <= 0 || cssHeight <= 0) return;
+    const MAX_DIMENSION = 2400;
+    const scale = Math.min(devicePixelRatio || 1, MAX_DIMENSION / Math.max(cssWidth, cssHeight));
+    const pixelWidth = Math.max(1, Math.round(cssWidth * scale));
+    const pixelHeight = Math.max(1, Math.round(cssHeight * scale));
+    if (this.canvas.width === pixelWidth && this.canvas.height === pixelHeight) return;
+    this.canvas.width = pixelWidth;
+    this.canvas.height = pixelHeight;
   }
 
   createTileTexture(image: HTMLImageElement | HTMLCanvasElement | ImageBitmap): WebGLTexture {
@@ -240,6 +271,13 @@ export class RoomCompositor {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     return texture;
+  }
+
+  /** Frees a mask texture created by `createMaskTexture` — used when a cached one is about to be
+   * replaced (a new photo's region reuses the same `region.id`, e.g. "floor-0", as the previous
+   * photo's), so the old GPU-side texture doesn't just leak. */
+  deleteTexture(texture: WebGLTexture) {
+    this.gl.deleteTexture(texture);
   }
 
   render(regions: RenderRegion[]) {

@@ -1,7 +1,13 @@
 import { DetectedRegion, Point, Quad } from "./types";
 
-const ANALYSIS_SERVICE_URL =
-  process.env.NEXT_PUBLIC_ANALYSIS_SERVICE_URL ?? "http://localhost:8000";
+// The analysis service URL must be provided via NEXT_PUBLIC_ANALYSIS_SERVICE_URL.
+// It is injected at build time for client-side code.
+const ANALYSIS_SERVICE_URL = process.env.NEXT_PUBLIC_ANALYSIS_SERVICE_URL;
+if (!ANALYSIS_SERVICE_URL) {
+  throw new Error(
+    "NEXT_PUBLIC_ANALYSIS_SERVICE_URL is not defined. Please set it in .env.local",
+  );
+}
 
 interface AnalyzeRegion {
   id: string;
@@ -70,11 +76,21 @@ export async function detectFloorAndWall(
   form.append("target_height", String(imgHeight));
 
   let res: Response;
+  console.log('Calling analysis service at', `${ANALYSIS_SERVICE_URL}/analyze`);
   try {
-    res = await fetch(`${ANALYSIS_SERVICE_URL}/analyze`, { method: "POST", body: form });
-  } catch {
+    res = await fetch(`${ANALYSIS_SERVICE_URL}/analyze`, { method: "POST", body: form, mode: "cors" });
+  } catch (err) {
+    console.error('Analysis service unreachable:', err);
+    // A network-level failure (the service is down, unreachable, or CORS-rejected) is not the
+    // same situation as a real analysis that legitimately found no floor or wall — returning an
+    // empty result here made the two indistinguishable to the caller, so `runDetection` always
+    // showed "we couldn't confidently find a floor or wall in this photo" even when the actual
+    // problem was that the backend never got a chance to look at it. Throwing the same
+    // `AnalysisServiceError` the HTTP-error branch below already uses (rather than inventing a
+    // second error path) lets `page.tsx`'s existing catch block show its own, more accurate
+    // message instead — no new error-handling machinery needed.
     throw new AnalysisServiceError(
-      "Couldn't reach the analysis service. Make sure the Python service (python-service/) is running.",
+      "Couldn't reach the analysis service. Check your connection and try again.",
     );
   }
   if (!res.ok) {
