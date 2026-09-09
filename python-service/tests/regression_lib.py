@@ -31,11 +31,22 @@ import vision  # noqa: E402
 TEST_IMAGES_DIR = Path(__file__).resolve().parent.parent.parent / "test-images"
 BASELINE_PATH = Path(__file__).resolve().parent / "baseline.json"
 
-# Real photos only — skips nothing currently, but keeps this list explicit so a new test image
-# dropped into test-images/ doesn't silently join the baseline without a deliberate re-capture.
+# Real photos only — kept explicit so a new test image dropped into test-images/ doesn't silently
+# join the baseline without a deliberate re-capture. The four added here cover the harder cases
+# found and fixed during a floor-detection review: "images (2).jpeg" and "images (4).jpeg" (thin
+# dining-chair/sofa legs bleeding floor paint), "images (5).jpeg" (a naturally textured stone floor
+# that a texture-based object heuristic was falsely excluding, and a dim/reflective room where
+# furniture masks overreach onto real floor), and "istockphoto-2185177891-612x612.jpg" (a large
+# patterned rug). Each was hand-verified (debug overlays, live renders) before being folded in here
+# — this baseline only ever guards against *silently* losing ground on a case already checked by
+# eye, it doesn't replace that check for a new one.
 IMAGE_NAMES = [
     "images.jpeg",
+    "images (2).jpeg",
+    "images (4).jpeg",
+    "images (5).jpeg",
     "istockphoto-2077892760-612x612.jpg",
+    "istockphoto-2185177891-612x612.jpg",
     "put-together-a-perfect-guest-room-1976987-hero-223e3e8f697e4b13b62ad4fe898d492d.jpg",
 ]
 

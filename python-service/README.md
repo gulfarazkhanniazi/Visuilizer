@@ -1,10 +1,10 @@
 # Room Visualizer — analysis service
 
 Runs the real floor/wall detection server-side in Python: SegFormer semantic segmentation,
-monocular depth estimation (Depth Anything V2), and an OpenCV/NumPy geometry pipeline (vanishing
-points, robust sub-pixel corner line fitting, shading/depth-based validation) that separates a
-wall into one independently selectable, independently designable region per real architectural
-corner. The Next.js app calls this directly from the browser.
+monocular depth estimation (Depth Anything V2), SAM 2 object-mask refinement, and an OpenCV/NumPy
+geometry pipeline (vanishing points, robust sub-pixel corner line fitting, shading/depth-based
+validation) that separates a wall into one independently selectable, independently designable
+region per real architectural corner. The Next.js app calls this directly from the browser.
 
 ## Setup (one-time)
 
@@ -13,6 +13,30 @@ cd python-service
 python3.11 -m venv venv          # 3.11 recommended — newer Pythons may lack PyTorch wheels
 ./venv/bin/pip install -r requirements.txt
 ```
+
+### SAM 2 setup (optional, recommended)
+
+Refines organic-object masks (plants, flowers — see `ORGANIC_COARSE_BLOB_LABELS` in `vision.py`)
+with [Meta's SAM 2](https://github.com/facebookresearch/sam2), a trained promptable segmentation
+model, in place of the GrabCut/watershed heuristic — leaf-level precision on irregular silhouettes
+instead of a blocky approximation. Entirely optional: `vision.py` falls back automatically to the
+original GrabCut/watershed refinement if this isn't set up, so skipping this section is fine.
+
+```bash
+git clone --depth 1 https://github.com/facebookresearch/sam2.git /tmp/sam2-src
+# Not -e (editable) -- that leaves the installed package pointing back at this clone, so deleting
+# /tmp/sam2-src afterwards silently breaks the install. A regular install copies the package in.
+SAM2_BUILD_CUDA=0 ./venv/bin/pip install /tmp/sam2-src   # CUDA extension optional, skipped here
+rm -rf /tmp/sam2-src
+
+mkdir -p sam2_checkpoints
+curl -L -o sam2_checkpoints/sam2.1_hiera_tiny.pt \
+  https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt
+```
+
+Runs on CUDA, Apple Silicon (MPS), or CPU automatically (see `_sam2_device` in `vision.py`). The
+tiny checkpoint (~150MB) is deliberate — this only ever refines one already-localized object at a
+time from a box prompt, not open-ended detection, so a larger checkpoint buys little here.
 
 ## Run
 

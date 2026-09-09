@@ -8,3 +8,8 @@ numpy
 pillow
 scipy
 torchvision
+
+# SAM 2 (object mask refinement, see vision.py's SAM2_CHECKPOINT/get_sam2_predictor) isn't on
+# PyPI under a stable name -- install from source, and place a checkpoint, per README.md's
+# "SAM 2 setup" section. Optional: vision.py falls back to its pre-SAM-2 GrabCut/watershed
+# refinement automatically if this isn't installed or the checkpoint file isn't present.

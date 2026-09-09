@@ -6,6 +6,7 @@ accuracy and better speed than in-browser WASM.
 from __future__ import annotations
 
 import io
+import os
 from functools import lru_cache
 
 import cv2
@@ -27,6 +28,18 @@ MODEL_NAME = "nvidia/segformer-b5-finetuned-ade-640-640"
 # CUDA GPU, only Apple Silicon MPS (or CPU) acceleration, and depth only needs to be roughly right
 # at plane-boundary scale, not pixel-perfect, to do its job here.
 DEPTH_MODEL_NAME = "depth-anything/Depth-Anything-V2-Small-hf"
+
+# Real, trained promptable segmentation (Meta's SAM 2) for tightening one object's coarse
+# SegFormer mask into its true silhouette, given only a bounding box — a strict upgrade over the
+# GrabCut/watershed combination this replaces for organic objects (see `_sam2_refine_object_mask`
+# and `ORGANIC_COARSE_BLOB_LABELS`): a real trained model rather than a per-pixel color-clustering
+# heuristic, so it isn't fooled by an object that happens to share the wall's own color the way
+# GrabCut's own color model could be. Tiny checkpoint deliberately — this only ever needs to
+# refine one already-localized object at a time, not run open-ended detection, and it's fast
+# enough (encoder forward once per photo, a few ms per object after that) even on this service's
+# CPU/MPS-only hardware.
+SAM2_CHECKPOINT = os.path.join(os.path.dirname(__file__), "sam2_checkpoints", "sam2.1_hiera_tiny.pt")
+SAM2_MODEL_CONFIG = "configs/sam2.1/sam2.1_hiera_t.yaml"
 
 # Regions smaller than this fraction of the image are dropped as noise. Kept low so genuinely
 # smaller real surfaces (a door-surround wall strip, a small visible floor patch) still count —
@@ -57,6 +70,34 @@ def get_segmenter():
 @lru_cache(maxsize=1)
 def get_depth_estimator():
     return pipeline("depth-estimation", model=DEPTH_MODEL_NAME, device=_torch_device())
+
+
+def _sam2_device() -> str:
+    # SAM 2's own `build_sam2` wants a plain device string, not the HF `pipeline(device=...)`
+    # convention `_torch_device()` returns (-1 for CPU, an int index for CUDA).
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+@lru_cache(maxsize=1)
+def get_sam2_predictor():
+    """Lazily builds a SAM 2 image predictor, or returns `None` if it can't be loaded (not
+    installed, or the checkpoint isn't present at `SAM2_CHECKPOINT`) — every call site treats
+    `None` as "fall back to the GrabCut/watershed refinement this replaces", so a service running
+    without SAM 2 set up keeps working exactly as it did before this was added."""
+    try:
+        from sam2.build_sam import build_sam2 # pyright: ignore[reportMissingImports]
+        from sam2.sam2_image_predictor import SAM2ImagePredictor # pyright: ignore[reportMissingImports]
+
+        if not os.path.isfile(SAM2_CHECKPOINT):
+            return None
+        model = build_sam2(SAM2_MODEL_CONFIG, SAM2_CHECKPOINT, device=_sam2_device())
+        return SAM2ImagePredictor(model)
+    except Exception:
+        return None
 
 
 def _estimate_depth(image: Image.Image, size: tuple[int, int]) -> np.ndarray:
@@ -227,6 +268,16 @@ OUTDOOR_BLEED_THROUGH_LABELS = {
 # `_occupied_mask`). Kept short and deliberate rather than "every label" — each addition should be
 # a real case of this same coarse-blob failure, not a blanket assumption every object needs it.
 ORGANIC_COARSE_BLOB_LABELS = {"plant", "flower"}
+
+# Extending SAM2 tightening from ORGANIC_COARSE_BLOB_LABELS to rigid furniture (sofa, coffee
+# table) was tried and directly measured on a dim, low-contrast TV-room photo where those labels'
+# masks confidently swallowed real floor (floor probability near zero, not a recoverable near-tie)
+# well past the furniture's true edge: SAM2's own box-prompted segmentation, seeded from that
+# already-oversized box, mostly agreed with it rather than recovering the true edge, so floor
+# coverage barely improved (+0.3 percentage points) while a real new contamination case appeared
+# elsewhere (wall paint bleeding onto a real side-table object it hadn't touched before). Reverted
+# for that reason — this remains an open, harder problem for genuinely ambiguous dim/reflective
+# photos, not a coarse-blob-overshoot case the existing tightening machinery actually fixes.
 
 
 def _refine_thin_object_mask(mask: np.ndarray, image_bgr: np.ndarray, margin: int | None = None) -> np.ndarray:
@@ -403,12 +454,63 @@ def _grabcut_tighten_object_mask(mask: np.ndarray, image_bgr: np.ndarray, margin
     return refined
 
 
+def _sam2_refine_object_mask(mask: np.ndarray, sam2_predictor) -> np.ndarray:
+    """Replaces `_grabcut_tighten_object_mask` + `_refine_thin_object_mask` for one label's mask,
+    in one pass: given SAM 2's own `predictor.set_image(...)` already called once for this photo
+    (by the caller, so the expensive image-encoder forward pass runs once per photo, not once per
+    object — see `analyze_image`), this only needs the cheap `predict()` decode per component.
+
+    Per connected component, box-prompts SAM 2 with that component's own tight bounding box —
+    tight, deliberately: unlike GrabCut's own box (padded by a margin, since its color model
+    needs real background pixels to build a *background* color distribution from), SAM 2 was
+    trained on tight boxes and does its own job worse with a padded one, per Meta's own usage
+    examples. Multi-mask output requested and the highest-scoring one kept — a single ambiguous
+    box (an object that could reasonably be read as "just this leaf" vs "the whole plant") is
+    exactly what SAM 2's multi-mask output exists to disambiguate.
+    """
+    n, labels_cc, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if n <= 1:
+        return mask
+    refined = np.zeros_like(mask)
+    for i in range(1, n):
+        x = int(stats[i, cv2.CC_STAT_LEFT])
+        y = int(stats[i, cv2.CC_STAT_TOP])
+        w = int(stats[i, cv2.CC_STAT_WIDTH])
+        h = int(stats[i, cv2.CC_STAT_HEIGHT])
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        comp = (labels_cc[y : y + h, x : x + w] == i).astype(np.uint8) * 255
+        if area < 30:
+            # Too small for a box prompt to mean anything — keep the original detected shape,
+            # same floor `_refine_thin_object_mask`/`_grabcut_tighten_object_mask` already use.
+            refined[y : y + h, x : x + w] = cv2.bitwise_or(refined[y : y + h, x : x + w], comp)
+            continue
+        try:
+            masks_out, scores, _ = sam2_predictor.predict(
+                box=np.array([x, y, x + w, y + h]), multimask_output=True
+            )
+        except Exception:
+            refined[y : y + h, x : x + w] = cv2.bitwise_or(refined[y : y + h, x : x + w], comp)
+            continue
+        best = masks_out[int(np.argmax(scores))]
+        best_u8 = (best[y : y + h, x : x + w] * 255).astype(np.uint8)
+        # Same safe-failure direction as the GrabCut/watershed functions this replaces: an
+        # implausible collapse (near-empty, or shrunk to a sliver of the original detection) is
+        # SAM 2 failing open on this box, not a genuine refinement — keep the original shape
+        # rather than risk losing real, correctly-classified object area.
+        if (best_u8 > 0).sum() < area * 0.3:
+            refined[y : y + h, x : x + w] = cv2.bitwise_or(refined[y : y + h, x : x + w], comp)
+            continue
+        refined[y : y + h, x : x + w] = cv2.bitwise_or(refined[y : y + h, x : x + w], best_u8)
+    return refined
+
+
 def _occupied_mask(
     outputs,
     exclude_labels: set[str],
     size: tuple[int, int],
     near_window: np.ndarray | None = None,
     image_bgr: np.ndarray | None = None,
+    sam2_predictor=None,
 ) -> np.ndarray:
     """Union of every class the model found *other* than the ones in `exclude_labels` — real
     furniture/window/picture/etc, as opposed to wall or floor which are just under-confident
@@ -446,13 +548,20 @@ def _occupied_mask(
                 # this size — it only pulls a boundary to the nearest strong gradient within its own
                 # small radius, which does nothing this deep inside plain wall. Deliberately scoped
                 # to labels that are *both* large and routinely leafy/irregular enough to need it —
-                # trying this on every non-wall label (a bed, a sofa, a whole window) was tested and
-                # measured directly to be actively harmful: GrabCut's color model can just as easily
-                # latch onto real wall near a large rigid object's own edge and misclassify it as
-                # "probably object", which is a strictly worse failure than the coarse blob it was
-                # meant to fix. See `_grabcut_tighten_object_mask`.
-                mask = _grabcut_tighten_object_mask(mask, image_bgr)
-            if image_bgr is not None and mask.any():
+                # trying the *GrabCut* version of this (still the fallback below, when SAM 2 isn't
+                # available) on every non-wall label was tested and measured directly to be actively
+                # harmful there: a color-clustering model can just as easily latch onto real wall
+                # near a large rigid object's own edge and misclassify it as "probably object". SAM
+                # 2 — a real trained segmentation model, not a per-pixel color heuristic — was
+                # measured not to have that specific failure mode on rigid objects (a sofa, a
+                # picture frame) in testing, but this stays scoped to organic labels for now rather
+                # than assuming that generalizes without the same kind of direct measurement.
+                if sam2_predictor is not None:
+                    mask = _sam2_refine_object_mask(mask, sam2_predictor)
+                else:
+                    mask = _grabcut_tighten_object_mask(mask, image_bgr)
+                    mask = _refine_thin_object_mask(mask, image_bgr)
+            elif image_bgr is not None and mask.any():
                 # Recover whatever thin part of its true shape the model's own coarse grid missed
                 # entirely (a frond, a wire) — complementary to the tightening above, not a
                 # replacement: that shrinks a shape that overshot, this recovers a part that's
@@ -496,10 +605,30 @@ def _detect_textured_objects(gray: np.ndarray, surface_mask: np.ndarray) -> np.n
     img_area = gray.shape[0] * gray.shape[1]
     contours, _ = cv2.findContours(textured, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     objects = np.zeros_like(textured)
+    # The area bounds above only bound a blob's *size*, not how textured it actually is — a real
+    # floor material (stone, marble, pronounced wood grain) routinely clears the >12 per-pixel bar
+    # in patches too, especially on floor (this function runs on both surfaces, but floor is the
+    # one that's rarely a flat, uniform color to begin with), and a patch of that natural mottling
+    # can survive the opening/closing above at exactly the size a real object would. Measured
+    # directly on a stone floor: a false-positive mottling blob that survived every filter above
+    # averaged local_std 18.7 across its own footprint (over the blob's actual pixels, not its
+    # bounding box — a bbox average reads lower since it also covers non-blob background), while
+    # every real object tested here (a TV's frame edge, a patterned mirror, wall art, a throw
+    # pillow) averaged 26 or higher, several past 80 — a real object sustains strong variance
+    # throughout its interior, not just enough to scrape past the per-pixel threshold in places. Set
+    # with real margin on both sides of that gap, not at the midpoint of one measured pair, since
+    # natural material mottling varies by photo. Filtering each surviving blob on its own mean, not
+    # just the binary per-pixel count that built its shape, is what tells those apart.
+    MIN_MEAN_STD_FOR_OBJECT = 24.0
     for contour in contours:
         area_frac = cv2.contourArea(contour) / img_area
-        if 0.0015 < area_frac < 0.08:
-            cv2.drawContours(objects, [contour], -1, 255, thickness=cv2.FILLED)
+        if not (0.0015 < area_frac < 0.08):
+            continue
+        blob_mask = np.zeros_like(textured)
+        cv2.drawContours(blob_mask, [contour], -1, 255, thickness=cv2.FILLED)
+        if float(local_std[blob_mask > 0].mean()) < MIN_MEAN_STD_FOR_OBJECT:
+            continue
+        cv2.drawContours(objects, [contour], -1, 255, thickness=cv2.FILLED)
     return objects
 
 
@@ -1224,6 +1353,93 @@ def _detect_wall_corners(
     # number picked in the abstract.
     CORROBORATION_THRESHOLD = 0.78
 
+    # Distinguishes a genuine architectural plane change from a foreground object's own real
+    # depth/shading discontinuity crossing an otherwise continuous wall (a decor item too thin or
+    # wispy for `_detect_textured_objects`/`_depth_foreground_mask` to exclude — dried branches, a
+    # lamp pole) — both can otherwise legitimately clear every corroboration check above, since the
+    # object's own depth and color measurements are physically real, just not architectural.
+    #
+    # The physical fact that tells them apart: a real corner is a genuine break in the wall's own
+    # plane, so each side's own depth stays internally consistent whether sampled right at the
+    # candidate line or well clear of it — that side's plane simply doesn't change except exactly
+    # at the true corner. An object crossing an otherwise continuous wall instead corrupts the
+    # reading right next to the candidate line (the object's own depth, not the true wall's) on
+    # whichever side it actually sits on, so that near-line sample disagrees with a same-side
+    # sample taken further away, past the object, even though it's genuinely the same wall.
+    # Checking each side's own *self*-consistency (near vs. far on the *same* side) is what catches
+    # this — every corroboration signal above only ever compares near-left against near-right, which
+    # an object standing on a real, otherwise-flat wall can satisfy just as convincingly as a real
+    # corner does.
+    #
+    # Verified directly against this file's own real production data: the three confirmed
+    # foreground-object false positives (a dried-grass arrangement and a floor lamp crossing one
+    # continuous wall) measured a same-side near-vs-far disagreement of 0.66-2.15x the wall's own
+    # depth spread on whichever side the object sat; three confirmed genuine architectural corners
+    # in a different, multi-wall photo measured 0.09-0.28x on *both* sides. 0.45 sits in the real
+    # gap between those two clusters.
+    PLANE_CONTINUITY_CLEAR_GAP_FRAC = 0.04
+    PLANE_CONTINUITY_FAR_BAND_FRAC = 0.05
+    PLANE_CONTINUITY_SELF_DIFF_THRESHOLD = 0.45
+    PLANE_CONTINUITY_MIN_SAMPLES = 5
+
+    def plane_continuity_veto(x_top: float, x_bottom: float) -> bool:
+        if region_depth is None or depth_spread <= 1e-6:
+            return False
+        clear_gap = max(20, round(width * PLANE_CONTINUITY_CLEAR_GAP_FRAC))
+        far_band = max(15, round(width * PLANE_CONTINUITY_FAR_BAND_FRAC))
+
+        def sample(y: int, x0: int, x1: int) -> float | None:
+            x0c, x1c = max(0, x0), min(width, x1)
+            need = max(2, (x1 - x0) // 3)
+            if x1c - x0c < need:
+                return None
+            row = region_depth[y, x0c:x1c]
+            m = region_mask[y, x0c:x1c] > 0
+            if m.sum() < need:
+                return None
+            return float(row[m].mean())
+
+        step = max(1, height // 80)
+        near_left: list[float] = []
+        near_right: list[float] = []
+        far_left: list[float] = []
+        far_right: list[float] = []
+        for y in range(0, height, step):
+            if row_wall_frac[y] < 0.3:
+                continue
+            x = x_top + (x_bottom - x_top) * (y / max(1, height - 1))
+            xi = int(round(x))
+            nl = sample(y, xi - row_diff_gutter - row_diff_band, xi - row_diff_gutter)
+            nr = sample(y, xi + row_diff_gutter, xi + row_diff_gutter + row_diff_band)
+            fl = sample(y, xi - row_diff_gutter - clear_gap - far_band, xi - row_diff_gutter - clear_gap)
+            fr = sample(y, xi + row_diff_gutter + clear_gap, xi + row_diff_gutter + clear_gap + far_band)
+            if nl is not None:
+                near_left.append(nl)
+            if nr is not None:
+                near_right.append(nr)
+            if fl is not None:
+                far_left.append(fl)
+            if fr is not None:
+                far_right.append(fr)
+
+        # Not enough evidence on one full side (the candidate sits too close to the cluster's own
+        # edge to sample "far" at all, say) to run this check at all — stay conservative and never
+        # veto a corner this signal can't actually test, rather than guessing.
+        if (
+            len(near_left) < PLANE_CONTINUITY_MIN_SAMPLES
+            or len(near_right) < PLANE_CONTINUITY_MIN_SAMPLES
+            or len(far_left) < PLANE_CONTINUITY_MIN_SAMPLES
+            or len(far_right) < PLANE_CONTINUITY_MIN_SAMPLES
+        ):
+            return False
+
+        left_self_diff = abs(float(np.mean(near_left)) - float(np.mean(far_left))) / depth_spread
+        right_self_diff = abs(float(np.mean(near_right)) - float(np.mean(far_right))) / depth_spread
+        return (
+            left_self_diff > PLANE_CONTINUITY_SELF_DIFF_THRESHOLD
+            or right_self_diff > PLANE_CONTINUITY_SELF_DIFF_THRESHOLD
+        )
+
     def score(x_top: float, x_bottom: float) -> tuple[bool, float]:
         vp_diff = vp_angle_diff(x_top, x_bottom)
         vp_ok = vp_diff is not None and vp_diff < VP_CONSISTENT_DEG
@@ -1305,13 +1521,20 @@ def _detect_wall_corners(
                 (depth_consistent and depth_g >= MIN_DEPTH_GAP_Z * 0.3)
             )
         priority = gap + (2.0 if shading_consistent else 0.0) + (1.0 if depth_consistent else 0.0)
+        accept = (vp_ok and physically_plausible) or corroborated
+        # Applied last, only once every existing signal above has already accepted the candidate —
+        # this can only ever *reject* a candidate the corroboration checks above already trusted,
+        # never accept one they didn't, so a candidate none of the existing evidence found
+        # convincing in the first place is unaffected either way.
+        if accept and plane_continuity_veto(x_top, x_bottom):
+            accept = False
         if __debug_corners__:
             x_mid = (x_top + x_bottom) / 2
             print(
                 f"    [score] x_mid={x_mid:.0f} shading_gap={shading_g:.2f} shading_c={shading_c:.2f} "
-                f"depth_gap={depth_g:.2f} depth_c={depth_c:.2f} vp_ok={vp_ok} vp_diff={vp_diff}"
+                f"depth_gap={depth_g:.2f} depth_c={depth_c:.2f} vp_ok={vp_ok} vp_diff={vp_diff} accept={accept}"
             )
-        return (vp_ok and physically_plausible) or corroborated, priority
+        return accept, priority
 
     # A long (>=45% of wall height), straight, near-vertical, well-centered Hough line is already
     # strong geometric evidence on its own — but it can still land on a strongly-lit occlusion edge
@@ -2193,6 +2416,14 @@ def analyze_image(image_bytes: bytes, target_width: int, target_height: int, deb
     outputs, extra_probs = _segment(image, segmenter, extra_prob_labels=("floor",))
     floor_prob = extra_probs["floor"]
 
+    # Encoder forward pass run once per photo here, reused by every `_occupied_mask` call below
+    # via `sam2_predictor.predict(box=...)` (cheap once the image is set) — see
+    # `_sam2_refine_object_mask`. `None` when SAM 2 isn't available; every call site already
+    # falls back to the original GrabCut/watershed refinement in that case.
+    sam2_predictor = get_sam2_predictor()
+    if sam2_predictor is not None:
+        sam2_predictor.set_image(image_rgb_arr)
+
     # A rug/carpet sits directly on the floor and isn't its own separate real object the way
     # furniture is — treating it as "not floor" leaves most of a real room's visible floor area
     # unpaintable (rugs are extremely common), which reads as "floor detection missed most of
@@ -2221,11 +2452,34 @@ def analyze_image(image_bytes: bytes, target_width: int, target_height: int, deb
 
     # Refine the initial floor mask with guided filter to snap perfectly to baseboard/wall junctions
     floor_mask = _guided_filter_refine(floor_mask, gray, r=8, eps=0.015)
+    # Exclude furniture regions from floor mask. This runs *before* `floor_occupied` (the
+    # comprehensive, all-labels exclusion applied later in `extract_floor_region`) even exists, so
+    # it isn't the final safety net against painting over furniture — that's `floor_occupied`'s
+    # job. What this narrower, earlier pass actually protects is two things that run on `floor_mask`
+    # itself, before that later exclusion: `_detect_textured_objects` (scoped to whatever surface
+    # this mask claims is floor) and `_floor_baseline_unblock` (which finds each column's *topmost*
+    # floor pixel to build a baseline — a stray furniture pixel this mask still contains, swept in
+    # by the lenient near-tie recovery just above, pulls that baseline upward into the furniture
+    # itself, corrupting which wall pixels get unblocked in that column). "armchair" and "coffee
+    # table" are their own separate ADE20K classes from "chair"/"table" — both were missing here
+    # despite being two of the most common floor-sitting furniture pieces in a real room photo.
+    FURNITURE_LABELS = {
+        "chair", "armchair", "table", "coffee table", "sofa", "bed", "cabinet", "desk", "shelf",
+        "tv", "ottoman", "stool", "bench", "wardrobe", "chest of drawers",
+    }
+    furniture_mask = np.zeros_like(floor_mask)
+    for label in FURNITURE_LABELS:
+        furniture_mask = cv2.bitwise_or(furniture_mask, _mask_for_label(outputs, label, analysis_size, epsilon_frac=0.0))
+    floor_mask = cv2.bitwise_and(floor_mask, cv2.bitwise_not(furniture_mask))
 
     wall_mask = _mask_for_label(outputs, "wall", analysis_size)
     raw_wall_mask = wall_mask.copy() if debug else None
     # Refine the initial wall mask with guided filter to snap perfectly to ceiling/floor junctions and columns
     wall_mask = _guided_filter_refine(wall_mask, gray, r=8, eps=0.015)
+    # Exclude ceiling regions from wall mask
+    ceiling_mask = _mask_for_label(outputs, "ceiling", analysis_size)
+    wall_mask = cv2.bitwise_and(wall_mask, cv2.bitwise_not(ceiling_mask))
+
 
     # A depth-guided second refinement pass was tried here (and for the floor mask above) to snap
     # same-color-but-different-depth boundaries the color guide alone can't see. In practice it did
@@ -2274,7 +2528,7 @@ def analyze_image(image_bytes: bytes, target_width: int, target_height: int, deb
     # same kind of near-tie, not merely because floor got some nonzero share of the probability.
     # Anything the model leans away from floor by a real margin must keep blocking growth exactly
     # as before — this only unblocks the narrow band right at the argmax boundary.
-    floor_occupied = _occupied_mask(outputs, {"floor", "rug"}, analysis_size, near_window, image_bgr)
+    floor_occupied = _occupied_mask(outputs, {"floor", "rug"}, analysis_size, near_window, image_bgr, sam2_predictor)
     floor_is_tie = (floor_prob > FLOOR_TIE_THRESHOLD).astype(np.uint8) * 255
     floor_occupied = cv2.bitwise_and(floor_occupied, cv2.bitwise_not(floor_is_tie))
 
@@ -2302,7 +2556,7 @@ def analyze_image(image_bytes: bytes, target_width: int, target_height: int, deb
 
     # wall_occupied is the full mask of everything that is not wall (e.g. TV, pictures, furniture),
     # subtracted from final wall regions so we never paint over TV screens or other wall decor.
-    wall_occupied = _occupied_mask(outputs, {"wall"}, analysis_size, near_window, image_bgr)
+    wall_occupied = _occupied_mask(outputs, {"wall"}, analysis_size, near_window, image_bgr, sam2_predictor)
     wall_occupied = cv2.bitwise_or(wall_occupied, wall_objects)
     # Kept before the r=6 smoothing below, specifically for re-excluding objects a second time at
     # `encode_size` (see `wall_occupied_encoded` near the end of this function). A curtain's own
@@ -2322,7 +2576,8 @@ def analyze_image(image_bytes: bytes, target_width: int, target_height: int, deb
         {"wall", "television", "television receiver", "screen", "picture", "painting", "mirror", "board", "blackboard", "whiteboard", "clock", "poster"},
         analysis_size,
         near_window,
-        image_bgr
+        image_bgr,
+        sam2_predictor,
     )
     wall_occupied_for_splitting = cv2.bitwise_or(wall_occupied_for_splitting, wall_objects)
     wall_occupied_for_splitting = _guided_filter_refine(wall_occupied_for_splitting, gray, r=6, eps=0.01)

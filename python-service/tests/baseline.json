@@ -2,43 +2,99 @@
   "images.jpeg": {
     "wall": {
       "count": 2,
-      "totalAreaFraction": 0.12472,
-      "meanSolidity": 0.8223
+      "totalAreaFraction": 0.11677,
+      "meanSolidity": 1.0
     },
     "floor": {
       "count": 1,
       "totalAreaFraction": 0.26928,
       "meanSolidity": 0.9847
     },
-    "objectContaminationRatio": 0.002633,
-    "boundaryStructuralEdgeAgreement": 0.8527
+    "objectContaminationRatio": 0.002582,
+    "boundaryStructuralEdgeAgreement": 0.8414
+  },
+  "images (2).jpeg": {
+    "wall": {
+      "count": 2,
+      "totalAreaFraction": 0.16592,
+      "meanSolidity": 0.9518
+    },
+    "floor": {
+      "count": 1,
+      "totalAreaFraction": 0.19504,
+      "meanSolidity": 1.0
+    },
+    "objectContaminationRatio": 0.005596,
+    "boundaryStructuralEdgeAgreement": 0.5767
+  },
+  "images (4).jpeg": {
+    "wall": {
+      "count": 3,
+      "totalAreaFraction": 0.49099,
+      "meanSolidity": 0.9021
+    },
+    "floor": {
+      "count": 1,
+      "totalAreaFraction": 0.1738,
+      "meanSolidity": 1.0
+    },
+    "objectContaminationRatio": 0.001216,
+    "boundaryStructuralEdgeAgreement": 0.5875
+  },
+  "images (5).jpeg": {
+    "wall": {
+      "count": 5,
+      "totalAreaFraction": 0.23298,
+      "meanSolidity": 1.0
+    },
+    "floor": {
+      "count": 1,
+      "totalAreaFraction": 0.07128,
+      "meanSolidity": 0.982
+    },
+    "objectContaminationRatio": 0.001999,
+    "boundaryStructuralEdgeAgreement": 0.7436
   },
   "istockphoto-2077892760-612x612.jpg": {
     "wall": {
-      "count": 3,
-      "totalAreaFraction": 0.28832,
-      "meanSolidity": 1.0
+      "count": 4,
+      "totalAreaFraction": 0.28865,
+      "meanSolidity": 0.9327
     },
     "floor": {
       "count": 1,
       "totalAreaFraction": 0.17935,
       "meanSolidity": 1.0
     },
-    "objectContaminationRatio": 0.001141,
-    "boundaryStructuralEdgeAgreement": 0.8288
+    "objectContaminationRatio": 0.000973,
+    "boundaryStructuralEdgeAgreement": 0.8221
+  },
+  "istockphoto-2185177891-612x612.jpg": {
+    "wall": {
+      "count": 2,
+      "totalAreaFraction": 0.35594,
+      "meanSolidity": 0.9998
+    },
+    "floor": {
+      "count": 1,
+      "totalAreaFraction": 0.21636,
+      "meanSolidity": 0.9828
+    },
+    "objectContaminationRatio": 0.00154,
+    "boundaryStructuralEdgeAgreement": 0.7443
   },
   "put-together-a-perfect-guest-room-1976987-hero-223e3e8f697e4b13b62ad4fe898d492d.jpg": {
     "wall": {
       "count": 3,
-      "totalAreaFraction": 0.2486,
-      "meanSolidity": 0.8584
+      "totalAreaFraction": 0.25772,
+      "meanSolidity": 0.8122
     },
     "floor": {
       "count": 1,
       "totalAreaFraction": 0.12268,
       "meanSolidity": 0.5869
     },
-    "objectContaminationRatio": 0.001095,
-    "boundaryStructuralEdgeAgreement": 0.5171
+    "objectContaminationRatio": 0.001165,
+    "boundaryStructuralEdgeAgreement": 0.549
   }
 }
