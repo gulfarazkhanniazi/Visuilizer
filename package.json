@@ -1,26 +1,18 @@
 {
-  "name": "testing-app",
-  "version": "0.1.0",
+  "name": "surface-visualizer",
   "private": true,
+  "version": "1.0.0",
+  "description": "Wall & floor tile visualizer - photoreal room preview with perspective-correct tiling, masking and baked-light compositing.",
+  "workspaces": ["server", "web"],
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
-    "lint": "eslint"
-  },
-  "dependencies": {
-    "next": "16.3.1",
-    "react": "19.2.8",
-    "react-dom": "19.2.8"
+    "dev": "concurrently -n api,web -c cyan,magenta \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "npm run dev -w server",
+    "dev:web": "npm run dev -w web",
+    "build": "npm run build -w web",
+    "seed": "npm run seed -w server",
+    "start": "npm run start -w server"
   },
   "devDependencies": {
-    "@tailwindcss/postcss": "^4",
-    "@types/node": "^20",
-    "@types/react": "^19",
-    "@types/react-dom": "^19",
-    "eslint": "^9",
-    "eslint-config-next": "16.3.1",
-    "tailwindcss": "^4",
-    "typescript": "^5"
+    "concurrently": "^9.1.2"
   }
 }
