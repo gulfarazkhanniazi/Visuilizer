@@ -767,7 +767,7 @@ function fitRange(P, a, b) {
  * the breakpoint that best explains the run, then merge back neighbours that
  * turn out to be collinear after all.
  */
-function segmentRuns(samples, { tol = 0.06, minSamples = 12, minSpanPx = 40, minWidth = 1.2, gain = 0.6 } = {}) {
+function segmentRuns(samples, { tol = 0.06, minSamples = 12, minSpanPx = 40, minWidth = 0.2, gain = 0.6 } = {}) {
   const n = samples.length;
   if (n < minSamples) return [];
   const P = junctionSums(samples);
@@ -893,21 +893,21 @@ function dropOutliers(samples, { window = 6, limit = 0.5 } = {}) {
  * whose fit is poor, which is precisely the signature of two walls averaged
  * into one.
  */
-function splitAtCorners(samples, runs, corners, { minSamples = 12, minSpanPx = 40, poorFit = 0.11 } = {}) {
+function splitAtCorners(samples, runs, corners, { minSamples = 3, minSpanPx = 5 } = {}) {
   const out = [];
+  const P = junctionSums(samples);
   for (const run of runs) {
     let pieces = [run];
-    if (run.fit.rms > poorFit) {
-      for (const corner of corners) {
-        const next = [];
-        for (const piece of pieces) {
-          const uLo = samples[piece.a].u;
-          const uHi = samples[piece.b].u;
-          if (corner.u <= uLo || corner.u >= uHi
-              || corner.u - uLo < minSpanPx || uHi - corner.u < minSpanPx) {
-            next.push(piece);
-            continue;
-          }
+    for (const corner of corners) {
+      const next = [];
+      for (const piece of pieces) {
+        const uLo = samples[piece.a].u;
+        const uHi = samples[piece.b].u;
+        if (corner.u <= uLo || corner.u >= uHi
+            || corner.u - uLo < minSpanPx || uHi - corner.u < minSpanPx) {
+          next.push(piece);
+          continue;
+        }
           let k = piece.a;
           while (k < piece.b && samples[k + 1].u <= corner.u) k += 1;
           if (k - piece.a + 1 < minSamples || piece.b - k < minSamples) {
@@ -918,7 +918,6 @@ function splitAtCorners(samples, runs, corners, { minSamples = 12, minSpanPx = 4
         }
         pieces = next;
       }
-    }
     out.push(...pieces);
   }
   return out.map((r) => ({ ...r, fit: r.fit ?? null }));
@@ -953,7 +952,7 @@ function wallPlanes(cam, mask, w, h, floorMask, ceilingMask, roomHeight, why = {
   // reads them in, and outliers removed first so one bad un-projection cannot
   // invent a corner.
   const samples = dropOutliers([...raw].sort((p, q) => p.u - q.u));
-  const minSpanPx = Math.max(30, w * 0.08);
+  const minSpanPx = Math.max(10, w * 0.02);
   let runs = segmentRuns(samples, { minSpanPx });
   why.runs = runs.length;
 
@@ -963,11 +962,11 @@ function wallPlanes(cam, mask, w, h, floorMask, ceilingMask, roomHeight, why = {
   // corner settles.
   if (corners.length) {
     const before = runs.length;
-    runs = splitAtCorners(samples, runs, corners, { minSpanPx });
+    runs = splitAtCorners(samples, runs, corners);
     why.cornerSplits = runs.length - before;
   }
 
-  const minSpan = w * 0.05;
+  const minSpan = w * 0.01;
   const planes = [];
   for (const run of runs) {
     const inliers = samples.slice(run.a, run.b + 1);
@@ -1052,9 +1051,7 @@ function assignWallPixels(cam, planes, mask, w, h) {
 
         const X = a * Z;
         const s = (X - g.origin[0]) * g.dir[0] + (Z - g.origin[1]) * g.dir[1];
-        if (s < g.s0 - sPad || s > g.s1 + sPad) continue;
         const Y = cam.height - b * Z;
-        if (Y < -yPad || Y > g.height + yPad) continue;
 
         bestZ = Z;
         best = i;
@@ -1139,15 +1136,52 @@ export async function autoDetectSurfaces(imagePath, opts = {}) {
   const other = new Float32Array(RW * RH);
   let hasOther = false;
 
+  const wallObjects = new Float32Array(RW * RH);
+  const floorObjects = new Float32Array(RW * RH);
+  let hasWallObjects = false;
+  let hasFloorObjects = false;
+
+  const resampleMaskAdd = (img, out, dw, dh) => {
+    const sw = img.width, sh = img.height;
+    const src = img.data;
+    for (let y = 0; y < dh; y++) {
+      const sy = Math.min(sh - 1, Math.floor((y * sh) / dh));
+      for (let x = 0; x < dw; x++) {
+        const sx = Math.min(sw - 1, Math.floor((x * sw) / dw));
+        out[y * dw + x] += src[sy * sw + sx] / 255;
+      }
+    }
+  };
+
+  const WALL_OBJECT_LABELS = new Set([
+    'painting, picture', 'windowpane, window', 'door, double door', 
+    'cabinet', 'mirror', 'sconce', 'radiator', 'fireplace, hearth, open fireplace',
+    'television, television receiver, television set, tv, tv set'
+  ]);
+
+  const FLOOR_OBJECT_LABELS = new Set([
+    'bed', 'sofa, couch, lounge', 'chair', 'table', 'coffee table', 
+    'stool', 'cushion', 'ottoman, pouf, pouffe, puff, hassock',
+    'rug, carpet, carpeting'
+  ]);
+
   for (const r of results) {
     const key = r.label.toLowerCase();
     if (SURFACE_CLASSES[key]) {
-      // Several ADE20K regions can share a label; merge them.
       soft[key] ??= new Float32Array(RW * RH);
       resampleMask(r.mask, soft[key], RW, RH);
     } else {
-      resampleMask(r.mask, other, RW, RH);
-      hasOther = true;
+      let isWallObj = WALL_OBJECT_LABELS.has(key);
+      let isFloorObj = FLOOR_OBJECT_LABELS.has(key);
+      
+      if (isWallObj) {
+        resampleMaskAdd(r.mask, wallObjects, RW, RH);
+        hasWallObjects = true;
+      }
+      if (isFloorObj) {
+        resampleMaskAdd(r.mask, floorObjects, RW, RH);
+        hasFloorObjects = true;
+      }
     }
   }
 
@@ -1163,43 +1197,39 @@ export async function autoDetectSurfaces(imagePath, opts = {}) {
     const rgb = await sharp(imagePath).removeAlpha().resize(RW, RH, { fit: 'fill' }).raw().toBuffer();
     const guide = toLuma(rgb, RW * RH);
     guideRef = guide;
-    const competitors = hasOther ? { ...soft, [OTHER_KEY]: other } : soft;
+    const combinedOther = new Float32Array(RW * RH);
+    if (hasWallObjects || hasFloorObjects) {
+      for (let i = 0; i < RW * RH; i++) {
+        combinedOther[i] = Math.max(wallObjects[i], floorObjects[i]);
+      }
+    }
+    const competitors = (hasWallObjects || hasFloorObjects) ? { ...soft, [OTHER_KEY]: combinedOther } : soft;
     const { masks: crisp, radius } = refineClassMaps(guide, competitors, RW, RH, {
       drop: [OTHER_KEY],
     });
 
-    // Whatever the comparison decided, a pixel the segmenter is confident is
-    // an object is never part of a surface. The argmax alone is a majority
-    // vote and can be talked round -- a rug lit like the floor beside it, a
-    // pale curtain against a pale wall -- and being talked round means laying
-    // tile over a rug, which is the single most obviously wrong thing this
-    // can do. Dilated by a pixel, because erring towards not tiling an object
-    // is invisible and erring the other way is not.
-    if (hasOther) {
-      const hard = new Uint8Array(RW * RH);
-      for (let i = 0; i < RW * RH; i++) if (other[i] >= 0.5) hard[i] = 1;
+    let occluderFloor = null;
+    let occluderWall = null;
+    
+    if (hasWallObjects || hasFloorObjects) {
+      const hardWall = new Uint8Array(RW * RH);
+      const hardFloor = new Uint8Array(RW * RH);
+      for (let i = 0; i < RW * RH; i++) {
+        if (wallObjects[i] >= 0.1) hardWall[i] = 1;
+        if (floorObjects[i] >= 0.01) hardFloor[i] = 1;
+      }
+      occluderWall = dilate(hardWall, RW, RH, 3);
+      occluderFloor = dilate(hardFloor, RW, RH, 3);
+      occluder = occluderWall; // keep a reference for upscale
 
-      // The segmenter gets an object's identity right far more often than its
-      // extent: it labels four fifths of a rug and leaves the last corner as
-      // floor, and every mask downstream inherits the mistake. Nothing else
-      // here can undo it -- the guided filter snaps a boundary to the nearest
-      // edge, and the nearest edge to a line drawn across the middle of a rug
-      // is a fold in the rug.
-      //
-      // But the missing corner is joined to the rest of the rug, and the rug's
-      // outline is a real edge in the photograph. So flood outwards from what
-      // the segmenter was sure of and let gradient stop it: the corner fills
-      // because nothing separates it from the rug, and the flood halts at the
-      // rug's edge because something does. Confined to floor pixels, since the
-      // floor is what this is being fixed for.
-      occluder = dilate(hard, RW, RH, 1);
       for (const key of Object.keys(crisp)) {
+        if (key === 'floor') continue; // Handled separately
         const m = crisp[key];
-        for (let i = 0; i < RW * RH; i++) if (occluder[i]) m[i] = 0;
+        for (let i = 0; i < RW * RH; i++) if (occluderWall[i]) m[i] = 0;
       }
     }
 
-    refineInfo = { width: RW, height: RH, radius, occluderClass: hasOther };
+    refineInfo = { width: RW, height: RH, radius, occluderClass: (hasWallObjects || hasFloorObjects) };
     wallRef = crisp.wall ?? null;
     for (const key of Object.keys(crisp)) {
       masks[key] = upscaleMask(crisp[key], RW, RH, w, h);

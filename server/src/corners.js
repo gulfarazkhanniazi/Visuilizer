@@ -125,3 +125,30 @@ export function verticalCorners(gray, mask, w, h, {
   }
   return kept.sort((a, b) => a.u - b.u);
 }
+
+/**
+ * Horizontal corner detection (for soffits, wainscoting, etc).
+ * Transposes the image, runs vertical corner detection, and transposes the results back.
+ */
+export function horizontalCorners(gray, mask, w, h, opts = {}) {
+  // Transpose gray and mask
+  const grayT = new Float32Array(w * h);
+  const maskT = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      grayT[x * h + y] = gray[y * w + x];
+      maskT[x * h + y] = mask[y * w + x];
+    }
+  }
+
+  // Find vertical corners on transposed image (where width=h, height=w)
+  const vCorners = verticalCorners(grayT, maskT, h, w, opts);
+
+  // Transpose back (u becomes v)
+  return vCorners.map(c => ({
+    v: c.u,
+    continuity: c.continuity,
+    contrast: c.contrast,
+    score: c.score
+  }));
+}

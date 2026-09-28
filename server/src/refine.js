@@ -214,3 +214,274 @@ export function dilate(mask, w, h, r) {
   }
   return out;
 }
+
+/**
+ * Morphological closing (dilate then erode).
+ */
+export function morphClose(mask, w, h, radius) {
+  const dilated = bfsDilate(mask, w, h, radius);
+  const inverted = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) inverted[i] = dilated[i] ? 0 : 255;
+  const erodedInvert = bfsDilate(inverted, w, h, radius);
+  const out = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) out[i] = erodedInvert[i] ? 0 : 255;
+  return out;
+}
+
+/**
+ * Grows mask up to `maxReach` into unclassified pixels.
+ * Halts at `occluder` pixels.
+ */
+export function growIntoUnclassified(mask, occluder, w, h, maxReach) {
+  const out = new Uint8Array(mask);
+  if (maxReach <= 0) return out;
+  const queue = new Int32Array(w * h);
+  let qHead = 0, qTail = 0;
+  const dist = new Int32Array(w * h).fill(-1);
+  for (let i = 0; i < w * h; i++) {
+    if (out[i]) {
+      dist[i] = 0;
+      queue[qTail++] = i;
+    }
+  }
+  while (qHead < qTail) {
+    const p = queue[qHead++];
+    const d = dist[p];
+    if (d >= maxReach) continue;
+    const x = p % w;
+    const y = Math.floor(p / w);
+
+    // Manual unrolling for maximum performance (avoids closure allocations)
+    const nextD = d + 1;
+    
+    // Left
+    if (x > 0) {
+      const ni = y * w + (x - 1);
+      if (!out[ni] && (!occluder || !occluder[ni])) { out[ni] = 255; dist[ni] = nextD; queue[qTail++] = ni; }
+    }
+    // Right
+    if (x < w - 1) {
+      const ni = y * w + (x + 1);
+      if (!out[ni] && (!occluder || !occluder[ni])) { out[ni] = 255; dist[ni] = nextD; queue[qTail++] = ni; }
+    }
+    // Top
+    if (y > 0) {
+      const ni = (y - 1) * w + x;
+      if (!out[ni] && (!occluder || !occluder[ni])) { out[ni] = 255; dist[ni] = nextD; queue[qTail++] = ni; }
+    }
+    // Bottom
+    if (y < h - 1) {
+      const ni = (y + 1) * w + x;
+      if (!out[ni] && (!occluder || !occluder[ni])) { out[ni] = 255; dist[ni] = nextD; queue[qTail++] = ni; }
+    }
+    // Top-left
+    if (x > 0 && y > 0) {
+      const ni = (y - 1) * w + (x - 1);
+      if (!out[ni] && (!occluder || !occluder[ni])) { out[ni] = 255; dist[ni] = nextD; queue[qTail++] = ni; }
+    }
+    // Top-right
+    if (x < w - 1 && y > 0) {
+      const ni = (y - 1) * w + (x + 1);
+      if (!out[ni] && (!occluder || !occluder[ni])) { out[ni] = 255; dist[ni] = nextD; queue[qTail++] = ni; }
+    }
+    // Bottom-left
+    if (x > 0 && y < h - 1) {
+      const ni = (y + 1) * w + (x - 1);
+      if (!out[ni] && (!occluder || !occluder[ni])) { out[ni] = 255; dist[ni] = nextD; queue[qTail++] = ni; }
+    }
+    // Bottom-right
+    if (x < w - 1 && y < h - 1) {
+      const ni = (y + 1) * w + (x + 1);
+      if (!out[ni] && (!occluder || !occluder[ni])) { out[ni] = 255; dist[ni] = nextD; queue[qTail++] = ni; }
+    }
+  }
+  return out;
+}
+
+/**
+ * Dilation using Breadth-First Search.
+ * Ensures an exact circular expansion up to `radius`.
+ */
+export function bfsDilate(mask, w, h, radius) {
+  const out = new Uint8Array(mask);
+  if (radius <= 0) return out;
+  const queue = new Int32Array(w * h);
+  let qHead = 0, qTail = 0;
+  const dist = new Int32Array(w * h).fill(-1);
+  for (let i = 0; i < w * h; i++) {
+    if (out[i]) {
+      dist[i] = 0;
+      queue[qTail++] = i;
+    }
+  }
+  while (qHead < qTail) {
+    const p = queue[qHead++];
+    const d = dist[p];
+    if (d >= radius) continue;
+    const x = p % w;
+    const y = Math.floor(p / w);
+    
+    const nextD = d + 1;
+
+    // Left
+    if (x > 0) {
+      const ni = y * w + (x - 1);
+      if (!out[ni]) { out[ni] = 255; dist[ni] = nextD; queue[qTail++] = ni; }
+    }
+    // Right
+    if (x < w - 1) {
+      const ni = y * w + (x + 1);
+      if (!out[ni]) { out[ni] = 255; dist[ni] = nextD; queue[qTail++] = ni; }
+    }
+    // Top
+    if (y > 0) {
+      const ni = (y - 1) * w + x;
+      if (!out[ni]) { out[ni] = 255; dist[ni] = nextD; queue[qTail++] = ni; }
+    }
+    // Bottom
+    if (y < h - 1) {
+      const ni = (y + 1) * w + x;
+      if (!out[ni]) { out[ni] = 255; dist[ni] = nextD; queue[qTail++] = ni; }
+    }
+    // Top-left
+    if (x > 0 && y > 0) {
+      const ni = (y - 1) * w + (x - 1);
+      if (!out[ni]) { out[ni] = 255; dist[ni] = nextD; queue[qTail++] = ni; }
+    }
+    // Top-right
+    if (x < w - 1 && y > 0) {
+      const ni = (y - 1) * w + (x + 1);
+      if (!out[ni]) { out[ni] = 255; dist[ni] = nextD; queue[qTail++] = ni; }
+    }
+    // Bottom-left
+    if (x > 0 && y < h - 1) {
+      const ni = (y + 1) * w + (x - 1);
+      if (!out[ni]) { out[ni] = 255; dist[ni] = nextD; queue[qTail++] = ni; }
+    }
+    // Bottom-right
+    if (x < w - 1 && y < h - 1) {
+      const ni = (y + 1) * w + (x + 1);
+      if (!out[ni]) { out[ni] = 255; dist[ni] = nextD; queue[qTail++] = ni; }
+    }
+  }
+  return out;
+}
+
+export function floorBaselineUnblock(floorMask, wallMask, w, h) {
+  const topY = new Int32Array(w).fill(-1);
+  let hasFloor = false;
+  for (let x = 0; x < w; x++) {
+    for (let y = 0; y < h; y++) {
+      if (floorMask[y * w + x]) {
+        topY[x] = y;
+        hasFloor = true;
+        break;
+      }
+    }
+  }
+  const out = new Uint8Array(w * h);
+  if (!hasFloor) return out;
+
+  // Fill in missing columns by searching left/right
+  for (let x = 0; x < w; x++) {
+    if (topY[x] === -1) {
+      let l = x - 1, r = x + 1;
+      while (l >= 0 && topY[l] === -1) l--;
+      while (r < w && topY[r] === -1) r++;
+      if (l >= 0 && r < w) {
+        topY[x] = topY[l] + (topY[r] - topY[l]) * ((x - l) / (r - l));
+      } else if (l >= 0) {
+        topY[x] = topY[l];
+      } else if (r < w) {
+        topY[x] = topY[r];
+      }
+    }
+  }
+
+  // Simple box blur
+  const blurW = Math.max(5, Math.round(w * 0.025));
+  const blurred = new Float32Array(w);
+  for (let x = 0; x < w; x++) {
+    let sum = 0, count = 0;
+    for (let k = -blurW; k <= blurW; k++) {
+      if (x + k >= 0 && x + k < w) { sum += topY[x + k]; count++; }
+    }
+    blurred[x] = sum / count;
+  }
+
+  const margin = Math.max(4, Math.round(h * 0.012));
+  for (let x = 0; x < w; x++) {
+    const y0 = Math.max(0, Math.round(blurred[x]) - margin);
+    for (let y = y0; y < h; y++) {
+      if (wallMask[y * w + x]) {
+        out[y * w + x] = 1;
+      }
+    }
+  }
+  return out;
+}
+
+export function detectTexturedObjects(gray, surfaceMask, w, h) {
+  const win = 9;
+  const halfWin = Math.floor(win / 2);
+  const out = new Uint8Array(w * h);
+
+  // Box blur for mean
+  const mean = new Float32Array(w * h);
+  const sqMean = new Float32Array(w * h);
+  
+  // Separable box blur for performance
+  const tempMean = new Float32Array(w * h);
+  const tempSq = new Float32Array(w * h);
+
+  // Horizontal pass
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let sum = 0, sqSum = 0, count = 0;
+      for (let k = -halfWin; k <= halfWin; k++) {
+        const nx = x + k;
+        if (nx >= 0 && nx < w) {
+          const val = gray[y * w + nx];
+          sum += val;
+          sqSum += val * val;
+          count++;
+        }
+      }
+      tempMean[y * w + x] = sum / count;
+      tempSq[y * w + x] = sqSum / count;
+    }
+  }
+
+  // Vertical pass
+  for (let x = 0; x < w; x++) {
+    for (let y = 0; y < h; y++) {
+      let sum = 0, sqSum = 0, count = 0;
+      for (let k = -halfWin; k <= halfWin; k++) {
+        const ny = y + k;
+        if (ny >= 0 && ny < h) {
+          sum += tempMean[ny * w + x];
+          sqSum += tempSq[ny * w + x];
+          count++;
+        }
+      }
+      mean[y * w + x] = sum / count;
+      sqMean[y * w + x] = sqSum / count;
+    }
+  }
+
+  // Calculate local standard deviation
+  for (let i = 0; i < w * h; i++) {
+    if (!surfaceMask[i]) continue;
+    const m = mean[i];
+    const sq = sqMean[i];
+    const variance = sq - m * m;
+    if (variance > 0) {
+      const stdDev = Math.sqrt(variance);
+      if (stdDev > 12) {
+        out[i] = 1;
+      }
+    }
+  }
+
+  return out;
+}
