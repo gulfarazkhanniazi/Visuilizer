@@ -3,14 +3,20 @@
   "private": true,
   "version": "1.0.0",
   "description": "Wall & floor tile visualizer - photoreal room preview with perspective-correct tiling, masking and baked-light compositing.",
-  "workspaces": ["server", "web"],
+  "workspaces": [
+    "server",
+    "web"
+  ],
   "scripts": {
-    "dev": "concurrently -n api,web -c cyan,magenta \"npm:dev:server\" \"npm:dev:web\"",
+    "dev": "concurrently -n api,web,cv -c cyan,magenta,yellow \"npm:dev:server\" \"npm:dev:web\" \"npm:dev:cv\"",
     "dev:server": "npm run dev -w server",
     "dev:web": "npm run dev -w web",
     "build": "npm run build -w web",
     "seed": "npm run seed -w server",
-    "start": "npm run start -w server"
+    "start": "npm run start -w server",
+    "dev:cv": "python3 cv-service/server.py",
+    "cv:install": "python3 -m pip install -r cv-service/requirements.txt",
+    "test": "npm test -w server"
   },
   "devDependencies": {
     "concurrently": "^9.1.2"

@@ -331,8 +331,8 @@ async function seedRooms() {
       isMain: s.name === 'floor',
       order: i,
       defaults: s.product_surface === 'floor'
-        ? { tileSize: { w: 600, h: 600 }, layout: 'grid', grout: { size: 2, color: '#c9c9c4' } }
-        : { tileSize: { w: 300, h: 600 }, layout: 'brick', grout: { size: 2, color: '#f5f5f2' } },
+        ? { tileSize: { w: 600, h: 600 }, layout: 'grid', grout: { size: 0, color: '#c9c9c4' } }
+        : { tileSize: { w: 300, h: 600 }, layout: 'brick', grout: { size: 0, color: '#f5f5f2' } },
     }));
 
     insert.run({

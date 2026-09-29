@@ -7,9 +7,14 @@ patterns and the room's own lighting. Flat photos and 360° panoramas both work.
 
 ```
 npm install
-npm run seed     # demo rooms, two 360 rooms, a 16-product starter catalogue
-npm run dev      # API on :5178, app on :5177
+npm run cv:install   # optional: Python deps for the 3D scanner's CV service
+npm run seed         # demo rooms, two 360 rooms, a 16-product starter catalogue
+npm run dev          # API on :5178, app on :5177, CV service on :5179
 ```
+
+Wall and corner detection now runs a 3D scanner (metric depth → planes →
+corners → raycast) and falls back to the junction scanner described below when
+the CV service is not running. See [SCANNER.md](SCANNER.md).
 
 Then open <http://localhost:5177>. The first visit to `/admin` claims the
 installation by creating an administrator; after that the panel needs a sign-in.

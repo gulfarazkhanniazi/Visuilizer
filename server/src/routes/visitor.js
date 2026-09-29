@@ -130,8 +130,9 @@ router.post('/stores', requireAuth, (req, res) => {
     city: b.city ?? null,
     phone: b.phone ?? null,
     email: b.email ?? null,
-    lat: b.lat != null ? Number(b.lat) : null,
-    lng: b.lng != null ? Number(b.lng) : null,
+    // An empty field means "no location", not 0,0 off the coast of Africa.
+    lat: b.lat != null && b.lat !== '' ? Number(b.lat) : null,
+    lng: b.lng != null && b.lng !== '' ? Number(b.lng) : null,
     sort: Number(b.sort ?? 0),
   });
   res.json(db.prepare('SELECT * FROM stores WHERE id = ?').get(id));

@@ -127,18 +127,15 @@ const vizSlice = createSlice({
           productId: product.id,
           model,
           tileSize: keep ?? sizes[0] ?? spec?.size ?? cur.tileSize,
-          gloss: product.gloss ?? cur.gloss,
+          gloss: 0,
+          grout: { ...cur.grout, size: 0 },
         };
         if (product.color) next.color = product.color;
         // A bond pattern only exists for modular materials; anything else
         // resolves as a plain grid and the control is hidden.
         if (model !== 'module') next.layout = 'grid';
         else if (changedModel && spec?.layout) next.layout = spec.layout;
-        if (model === 'sheet' || model === 'piece' || model === 'solid') {
-          next.grout = { ...cur.grout, size: 0 };
-        } else if ((cur.grout?.size ?? 0) === 0 && changedModel) {
-          next.grout = { ...cur.grout, size: 2 };
-        }
+        
         if (model === 'piece' && changedModel) next.offset = { x: 0, y: 0 };
         state.frames[f][name] = next;
       }

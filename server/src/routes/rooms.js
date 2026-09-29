@@ -85,7 +85,10 @@ router.post('/rooms/upload', upload.single('photo'), guardPresetUpload, async (r
       photo.thumb,
       photo.width,
       photo.height,
-      JSON.stringify({ objectList: [], settings: { blurRadius: 6 } }),
+      JSON.stringify({
+        objectList: [],
+        settings: { blurRadius: 6, ...(photo.focal35 ? { exif: { focal35: photo.focal35 } } : {}) },
+      }),
       isCustom ? 1 : 0,
       req.body.owner || null,
     );
@@ -151,9 +154,29 @@ router.post('/rooms/:id/auto-detect', async (req, res, next) => {
     }
 
     const file = path.join(UPLOAD_DIR, path.basename(row.image));
+    const current0 = JSON.parse(row.data);
+    // Field of view: one the caller states, else the lens recorded in the
+    // photo's EXIF at upload, else the scanner estimates it.
+    let hfov = Number(req.body?.hfov) || null;
+    let hfovSource = hfov ? 'caller' : null;
+    const f35 = current0.settings?.exif?.focal35;
+    if (!hfov && f35) {
+      const fPx = (Math.hypot(row.width, row.height) * f35) / 43.27;
+      hfov = (2 * Math.atan(row.width / (2 * fPx)) * 180) / Math.PI;
+      hfovSource = 'exif';
+    }
+    const quality = ['fast', 'balanced', 'high'].includes(req.body?.quality) ? req.body.quality : undefined;
+    // Debug images are written to the server's disk: development only,
+    // unless explicitly enabled.
+    const debug = req.body?.debug === true
+      && (process.env.NODE_ENV !== 'production' || process.env.SCAN_DEBUG_API === '1');
     const result = await detectSurfaces(file, {
       roomHeight: Number(req.body?.roomHeight) || 2.7,
-      hfov: Number(req.body?.hfov) || 70,
+      hfov: hfov ?? 70,
+      hfovExplicit: !!hfov,
+      hfovSource,
+      quality,
+      debug,
       includeCeiling: req.body?.includeCeiling === true,
     });
 
@@ -164,11 +187,13 @@ router.post('/rooms/:id/auto-detect', async (req, res, next) => {
       });
     }
 
-    const current = JSON.parse(row.data);
+    const current = current0;
     db.prepare('UPDATE rooms SET data = ? WHERE id = ?').run(
       JSON.stringify({
         objectList: result.objectList,
-        settings: { ...current.settings, camera: result.camera, autoDetected: true },
+        settings: {
+          ...current.settings, camera: result.camera, autoDetected: true, scan: scanSummary(result.scan),
+        },
       }),
       req.params.id,
     );
@@ -177,9 +202,41 @@ router.post('/rooms/:id/auto-detect', async (req, res, next) => {
       room: hydrateRoom(db.prepare('SELECT * FROM rooms WHERE id = ?').get(req.params.id)),
       camera: result.camera,
       detected: result.detected,
+      scan: result.scan,
     });
   } catch (e) { next(e); }
 });
+
+/**
+ * What of a scan is worth keeping with the room: which scanner ran, the
+ * walls' planes and confidences, the corners and the model versions -- not
+ * the polygons, which the objectList already holds.
+ */
+function scanSummary(scan) {
+  if (!scan) return undefined;
+  return {
+    version: scan.version,
+    scanner: scan.scanner,
+    quality: scan.quality,
+    fallbackReason: scan.fallbackReason,
+    walls: scan.walls.map((wl) => ({
+      id: wl.id,
+      objectName: wl.objectName,
+      selectable: wl.selectable,
+      plane: wl.plane,
+      normal: wl.normal,
+      polygon3D: wl.polygon3D,
+      corners: wl.corners,
+      confidence: wl.confidence,
+    })),
+    corners: scan.corners.map((c) => ({
+      id: c.id, wallA: c.wallA, wallB: c.wallB, type: c.type, position2D: c.position2D, position3D: c.position3D,
+      angle: c.angle, visible: c.visible, inferred: c.inferred, confidence: c.confidence,
+    })),
+    camera: scan.camera,
+    modelVersions: scan.metadata?.modelVersions,
+  };
+}
 
 /** Save the surfaces the studio authored for a room. */
 router.put('/rooms/:id', async (req, res, next) => {
@@ -226,9 +283,14 @@ router.delete('/rooms/:id', async (req, res, next) => {
       return res.status(401).json({ error: 'Sign in to delete this room', needsAuth: true });
     }
     db.prepare('DELETE FROM rooms WHERE id = ?').run(req.params.id);
-    await removeUpload(row.image);
-    await removeUpload(row.thumb);
-    if (row.model && row.model !== row.image) await removeUpload(row.model);
+    // A duplicated room shares its photo (and model) files with the room it
+    // was copied from, so only delete a file no remaining room still uses.
+    const inUse = (url) => !!db.prepare(
+      'SELECT 1 FROM rooms WHERE image = ? OR thumb = ? OR model = ? LIMIT 1',
+    ).get(url, url, url);
+    for (const url of new Set([row.image, row.thumb, row.model].filter(Boolean))) {
+      if (!inUse(url)) await removeUpload(url);
+    }
     res.json({ ok: true });
   } catch (e) { next(e); }
 });
@@ -239,10 +301,10 @@ router.post('/rooms/:id/duplicate', requireAuth, (req, res) => {
   if (!row) return res.status(404).json({ error: 'Room not found' });
   const id = `room_${nano()}`;
   db.prepare(`
-    INSERT INTO rooms (id, name, category, image, thumb, width, height, data, is_custom, owner, sort)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO rooms (id, name, category, image, thumb, width, height, data, is_custom, owner, sort, kind, model)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(id, `${row.name} copy`, row.category, row.image, row.thumb,
-         row.width, row.height, row.data, row.is_custom, row.owner, row.sort);
+    row.width, row.height, row.data, row.is_custom, row.owner, row.sort, row.kind ?? '2d', row.model ?? null);
   res.status(201).json(hydrateRoom(db.prepare('SELECT * FROM rooms WHERE id = ?').get(id)));
 });
 

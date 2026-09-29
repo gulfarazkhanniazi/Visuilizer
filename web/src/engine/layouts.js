@@ -85,11 +85,11 @@ export function defaultSurfaceState(surfaceKey = 'floor') {
     layout: 'grid',
     rotation: 0,          // degrees, applied before the layout
     offset: { x: 0, y: 0 },// metres
-    grout: { size: 2, color: '#c9c9c4' },
-    bevel: 0.35,          // joint shading strength
-    gloss: 0.25,          // 0 matt .. 1 polished
-    shade: 1.0,           // how strongly the room's own light/shadow is kept
-    detail: 0.6,          // how much fine photo detail bleeds through
+    grout: { size: 0, color: '#c9c9c4' },
+    bevel: 0,             // joint shading strength
+    gloss: 0,             // 0 matt .. 1 polished
+    shade: 0,             // how strongly the room's own light/shadow is kept
+    detail: 0,            // how much fine photo detail bleeds through
     randomFace: true,
     randomRotate: false,
     tint: '#ffffff',

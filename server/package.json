@@ -7,7 +7,10 @@
   "scripts": {
     "dev": "node --watch-path=src src/index.js",
     "start": "node src/index.js",
-    "seed": "node src/seed.js"
+    "seed": "node src/seed.js",
+    "test": "node --test --test-reporter=spec \"test/**/*.test.js\"",
+    "test:synthetic": "node scripts/synthetic-report.js",
+    "scan:report": "node scripts/scan-report.js"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",

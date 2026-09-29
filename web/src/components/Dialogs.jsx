@@ -132,7 +132,13 @@ export function CalculatorDialog({ onClose }) {
         productId: frames[activeFrame][o.name].productId,
         tileSize: frames[activeFrame][o.name].tileSize,
       }));
-    setRows(seeded.length ? seeded : [{ key: 'manual', label: 'Area 1', area: '', productId: products[0]?.id, tileSize: { w: 600, h: 600 } }]);
+    const next = seeded.length ? seeded : [{ key: 'manual', label: 'Area 1', area: '', productId: products[0]?.id, tileSize: { w: 600, h: 600 } }];
+    // Re-seeding (the catalogue or the look refreshed while the dialog is
+    // open) keeps whatever area was already typed for the same surface.
+    setRows((prev) => next.map((row) => {
+      const old = prev.find((p) => p.key === row.key);
+      return old ? { ...row, area: old.area } : row;
+    }));
   }, [room, activeFrame, frames, products]);
 
   // Rooms may carry a lens correction; the homography and the area integral
@@ -143,6 +149,18 @@ export function CalculatorDialog({ onClose }) {
     const H = surfaceHomography(obj.quad, obj.realSize.w, obj.realSize.h, lens);
     const hInv = H ? invert3(H) : null;
     return surfaceAreaSqm(obj.mask, hInv, room.width, room.height, 3, lens.k1);
+  }
+
+  // Areas already entered are converted, so switching units keeps the same
+  // amount of floor rather than reinterpreting the number.
+  function changeUnit(next) {
+    if (next === unit) return;
+    const f = next === 'sqft' ? SQFT_PER_SQM : 1 / SQFT_PER_SQM;
+    setRows((r) => r.map((row) => {
+      const v = parseFloat(row.area);
+      return Number.isFinite(v) ? { ...row, area: (v * f).toFixed(2) } : row;
+    }));
+    setUnit(next);
   }
 
   function measure(i) {
@@ -195,6 +213,12 @@ export function CalculatorDialog({ onClose }) {
     if (product.price != null) {
       if (model === 'piece') cost = product.priceUnit === 'pc' ? product.price : billedSqm * product.price;
       else if (model === 'joint') cost = null;
+      // The price is per whatever unit the product is sold in: per m2 (the
+      // default), per sq ft, per box or per piece. A unit with no count to
+      // multiply by here (boxes unknown) has no honest cost.
+      else if (product.priceUnit === 'sqft') cost = billedSqm * SQFT_PER_SQM * product.price;
+      else if (product.priceUnit === 'box') cost = boxes != null ? boxes * product.price : null;
+      else if (product.priceUnit === 'pc') cost = pieces != null ? pieces * product.price : null;
       else cost = billedSqm * product.price;
     }
 
@@ -214,7 +238,7 @@ export function CalculatorDialog({ onClose }) {
           <label>{t('calc.measureIn')}</label>
           <div className="row">
             {['sqm', 'sqft'].map((u) => (
-              <button key={u} className={`opt grow ${unit === u ? 'active' : ''}`} onClick={() => setUnit(u)}>
+              <button key={u} className={`opt grow ${unit === u ? 'active' : ''}`} onClick={() => changeUnit(u)}>
                 {u === 'sqm' ? t('calc.sqm') : t('calc.sqft')}
               </button>
             ))}

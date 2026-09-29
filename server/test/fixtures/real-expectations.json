@@ -1,0 +1,33 @@
+{
+  "_comment": "Manually verified against the photographs (see test/reports). walls: acceptable range of selectable walls; mustInclude: wall names that must be present; corners: acceptable range; the old scanner's result is kept for comparison.",
+  "images (2).jpeg": {
+    "scene": "peach living room: left wall, back wall with curtains and window; left/back corner partly behind a plant",
+    "walls": [2, 3], "mustInclude": ["left_wall", "back_wall"], "corners": [1, 1],
+    "legacy": { "walls": 2, "problem": "left wall bleeds across the back wall; left/back corner missed" }
+  },
+  "images (5).jpeg": {
+    "scene": "TV room: recessed dark TV panel, grey back wall with painting, right window wall",
+    "walls": [3, 4], "mustInclude": ["back_wall", "back_wall_2", "right_wall"], "corners": [1, 2],
+    "legacy": { "walls": 4, "problem": "TV wall split in two, window wall mislabelled" }
+  },
+  "images.jpeg": {
+    "scene": "living room: long left wall, curtained back wall, glass partition on the right",
+    "walls": [2, 3], "mustInclude": ["left_wall", "right_wall"], "corners": [0, 2],
+    "legacy": { "walls": 5, "problem": "glass partition split into 4 false 'right walls'; left wall named right" }
+  },
+  "istockphoto-2077892760-612x612.jpg": {
+    "scene": "wood-panelled wall, chimney breast with fireplace, back wall with painting",
+    "walls": [3, 3], "mustInclude": ["back_wall", "back_wall_2", "back_wall_3"], "corners": [2, 2],
+    "legacy": { "walls": 2, "problem": "chimney breast merged into the back wall" }
+  },
+  "istockphoto-2185177891-612x612.jpg": {
+    "scene": "single back wall with a hard diagonal sunlight shadow, plants and sofa",
+    "walls": [1, 1], "mustInclude": ["back_wall"], "corners": [0, 0],
+    "legacy": { "walls": 1, "problem": "none for walls" }
+  },
+  "put-together-a-perfect-guest-room-1976987-hero-223e3e8f697e4b13b62ad4fe898d492d.jpg": {
+    "scene": "bedroom: left wall with plant, back wall with tapestry and bed, right wall with a large window",
+    "walls": [3, 3], "mustInclude": ["left_wall", "back_wall", "right_wall"], "corners": [2, 2],
+    "legacy": { "walls": 5, "problem": "left wall split into 3, window frame split the right wall" }
+  }
+}

@@ -50,6 +50,9 @@ export default function Visualizer() {
 
   const room = useSelector((s) => s.viz.room);
   const status = useSelector((s) => s.viz.status);
+  // Read with every other hook: calling it only inside the error branch below
+  // changes the hook count between renders, which React cannot survive.
+  const loadError = useSelector((s) => s.viz.error);
   const frames = useSelector((s) => s.viz.frames);
   const compare = useSelector((s) => s.viz.compare);
   const split = useSelector((s) => s.viz.split);
@@ -76,6 +79,8 @@ export default function Visualizer() {
   // Both alternative renderers own their own canvas and camera, so the flat
   // path's zoom, pan, masks and compare split do not apply to either.
   const isFlat = !is360 && !is3d;
+  // Same condition the Compare button is shown under.
+  const compareAllowed = isFlat && vendor?.settings?.allowCompare !== false;
   // Show the surface markers for a few seconds on arrival, then let the
   // toolbar button take over -- they explain the room once, not permanently.
   const [pinsIntro] = useIntroPins(room?.id, isFlat);
@@ -131,11 +136,13 @@ export default function Visualizer() {
         e.preventDefault();
         dispatch(e.shiftKey ? redo() : undo());
       } else if (e.key === '0') dispatch(resetView());
-      else if (e.key === 'c') dispatch(setCompare(!compare));
+      // Only where the Compare button itself is offered: flat rooms, and
+      // not when the vendor has switched comparison off.
+      else if (e.key === 'c' && compareAllowed) dispatch(setCompare(!compare));
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [dispatch, compare]);
+  }, [dispatch, compare, compareAllowed]);
 
   // --- fullscreen -----------------------------------------------------------
   useEffect(() => {
@@ -168,7 +175,7 @@ export default function Visualizer() {
     try {
       const r = isFlat ? renderer.current : pano.current;
       const preview = r
-        ? (isFlat ? r.exportFrame('left') : r.exportView()).toDataURL('image/jpeg', 0.7)
+        ? (isFlat ? r.exportFrame(compare ? activeFrame : 'left') : r.exportView()).toDataURL('image/jpeg', 0.7)
         : null;
       await api.saveScheme(room.id, name, { frames, compare, split, activeSurface }, preview);
       track('save_scheme', { roomId: room.id });
@@ -285,12 +292,15 @@ export default function Visualizer() {
     }
 
     canvas.toBlob((blob) => {
+      if (!blob) return;
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
       a.download = `${slug()}-visualisation-${quality}.jpg`;
       a.click();
-      URL.revokeObjectURL(url);
+      // Revoking straight after click() can cancel the download in Firefox
+      // and Safari, which start it asynchronously.
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
       track('download', { roomId: room.id, meta: { quality } });
       toast(t('download.done', { quality: quality.toUpperCase() }), 'ok');
     }, 'image/jpeg', quality === 'hd' ? 0.94 : 0.86);
@@ -326,7 +336,7 @@ export default function Visualizer() {
     const r = isFlat ? renderer.current : pano.current;
     try {
       const preview = r
-        ? (isFlat ? r.exportFrame('left') : r.exportView()).toDataURL('image/jpeg', 0.7)
+        ? (isFlat ? r.exportFrame(compare ? activeFrame : 'left') : r.exportView()).toDataURL('image/jpeg', 0.7)
         : null;
       const { code } = await api.share(
         { roomId: room.id, frames, compare, split, activeSurface },
@@ -344,7 +354,7 @@ export default function Visualizer() {
       <main className="page">
         <div className="page-inner">
           <h1>{t('common.cannotOpen')}</h1>
-          <p className="muted">{useSelector((s) => s.viz.error)}</p>
+          <p className="muted">{loadError}</p>
           <button className="btn" onClick={() => navigate('/')}>{t('common.back')}</button>
         </div>
       </main>

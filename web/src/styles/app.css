@@ -1052,3 +1052,6 @@ html.kiosk, html.kiosk body { overscroll-behavior: none; user-select: none; }
 }
 .mesh-row.on { border-color: var(--accent); background: var(--accent-dim); }
 .mesh-row strong { word-break: break-all; }
+
+/* Scanner confidence below "good" in the Studio surface list. */
+.surface-item .conf-low { color: #b45309; }

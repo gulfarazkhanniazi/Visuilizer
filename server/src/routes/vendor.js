@@ -2,6 +2,17 @@ import { Router } from 'express';
 import { db } from '../db.js';
 import { upload, saveThumb } from '../storage.js';
 import { requireAuth } from '../auth.js';
+import { rateLimit } from '../ratelimit.js';
+
+// Enquiry fields are free text from anyone; keep them to sensible sizes.
+const cap = (v, n) => (v == null ? null : String(v).slice(0, n));
+// The scheme the visitor was looking at. Never cut a JSON string -- the lead
+// list parses it -- so an implausibly large one is replaced, not truncated.
+const contextJson = (context) => {
+  if (!context) return null;
+  const s = JSON.stringify(context);
+  return s.length <= 50000 ? s : JSON.stringify({ omitted: 'context too large' });
+};
 
 const router = Router();
 
@@ -41,7 +52,7 @@ router.post('/vendor/logo', requireAuth, upload.single('logo'), async (req, res,
   } catch (e) { next(e); }
 });
 
-router.post('/leads', (req, res) => {
+router.post('/leads', rateLimit({ max: 30, name: 'enquiries' }), (req, res) => {
   const { name, email, phone, message, context } = req.body ?? {};
   if (!email && !phone) {
     return res.status(400).json({ error: 'An email address or phone number is required' });
@@ -49,8 +60,8 @@ router.post('/leads', (req, res) => {
   const info = db.prepare(`
     INSERT INTO leads (name, email, phone, message, context)
     VALUES (?, ?, ?, ?, ?)
-  `).run(name ?? null, email ?? null, phone ?? null, message ?? null,
-         context ? JSON.stringify(context) : null);
+  `).run(cap(name, 200), cap(email, 200), cap(phone, 60), cap(message, 5000),
+         contextJson(context));
   res.status(201).json({ id: info.lastInsertRowid });
 });
 

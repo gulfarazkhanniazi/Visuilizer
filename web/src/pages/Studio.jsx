@@ -80,7 +80,12 @@ export default function Studio() {
       ? [[w * 0.30, h * 0.58], [w * 0.70, h * 0.58], [w * 0.98, h * 0.97], [w * 0.02, h * 0.97]]
       : [[w * 0.28, h * 0.22], [w * 0.72, h * 0.22], [w * 0.72, h * 0.70], [w * 0.28, h * 0.70]];
 
-    const n = surfaces.filter((s) => s.product_surface === type).length;
+    // Names must be unique -- everything downstream keys surfaces by name.
+    // Counting the surfaces of this type is not enough: delete `floor` from
+    // [floor, floor_2] and the count would hand out `floor_2` a second time.
+    let n = surfaces.filter((s) => s.product_surface === type).length;
+    const taken = new Set(surfaces.map((s) => s.name));
+    while (taken.has(`${type}${n ? `_${n + 1}` : ''}`)) n++;
     const name = `${type}${n ? `_${n + 1}` : ''}`;
     const next = {
       name,
@@ -397,6 +402,12 @@ export default function Studio() {
                       <span>
                         {s.product_surface} · {s.realSize.w}×{s.realSize.h} m ·{' '}
                         {s.mask?.polygons?.length ?? 0} shapes
+                        {/* Scanner confidence, so an uncertain wall is visible as such. */}
+                        {typeof s.confidence === 'number' && (
+                          <span title="Scanner confidence in this wall's plane" className={s.confidence < 0.75 ? 'conf-low' : undefined}>
+                            {' '}· {Math.round(s.confidence * 100)}% sure
+                          </span>
+                        )}
                       </span>
                     </span>
                     <button

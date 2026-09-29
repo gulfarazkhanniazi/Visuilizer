@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { db } from '../db.js';
 import { requireAuth } from '../auth.js';
+import { rateLimit } from '../ratelimit.js';
 
 /**
  * Usage analytics.
@@ -49,7 +50,7 @@ const insert = db.prepare(`
 `);
 const insertMany = db.transaction((rows) => rows.forEach((r) => insert.run(r)));
 
-router.post('/events', (req, res) => {
+router.post('/events', rateLimit({ max: 3000, name: 'events' }), (req, res) => {
   const batch = Array.isArray(req.body?.events) ? req.body.events.slice(0, 50) : [];
   // sendBeacon cannot set headers, so an unloading page passes the visitor id
   // in the body instead. Same anonymous id either way.

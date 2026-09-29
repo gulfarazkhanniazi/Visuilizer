@@ -1,0 +1,11 @@
+# CV service for the room scanner (python3 cv-service/server.py).
+# Versions this was built and tested with; torch picks CUDA, Apple MPS or CPU
+# at runtime, so the same requirements serve every machine.
+torch>=2.4
+transformers>=5.0
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2
+numpy>=1.26
+opencv-python-headless>=4.9
+pillow>=10

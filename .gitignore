@@ -22,3 +22,10 @@ npm-debug.log*
 .next/
 next-env.d.ts
 *.tsbuildinfo
+
+# scanner output: reports, debug images, python cache
+server/test/reports/
+server/data/debug/
+__pycache__/
+
+detector

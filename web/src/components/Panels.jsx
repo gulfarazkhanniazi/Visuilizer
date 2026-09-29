@@ -516,7 +516,7 @@ export function GroutPanel() {
   if (!state) return null;
 
   const set = (patch) => dispatch(updateSurface({ patch }));
-  const grout = state.grout ?? { size: 2, color: '#c9c9c4' };
+  const grout = state.grout ?? { size: 0, color: '#c9c9c4' };
 
   return (
     <>
@@ -589,7 +589,7 @@ export function GroutPanel() {
         <Section title={t('grout.edge')}>
           <Slider
             label={t('grout.bevel')}
-            value={state.bevel ?? 0.35}
+            value={state.bevel ?? 0}
             min={0}
             max={1}
             step={0.01}
@@ -628,7 +628,7 @@ export function FinishPanel() {
         </div>
         <Slider
           label={t('finish.reflectivity')}
-          value={state.gloss ?? 0.25}
+          value={state.gloss ?? 0}
           min={0}
           max={1.2}
           step={0.01}
@@ -640,7 +640,7 @@ export function FinishPanel() {
       <Section title={t('finish.blend')}>
         <Slider
           label={t('finish.keepLighting')}
-          value={state.shade ?? 1}
+          value={state.shade ?? 0}
           min={0}
           max={1.8}
           step={0.01}
@@ -652,7 +652,7 @@ export function FinishPanel() {
         </p>
         <Slider
           label={t('finish.detail')}
-          value={state.detail ?? 0.6}
+          value={state.detail ?? 0}
           min={0}
           max={1.5}
           step={0.01}

@@ -1,6 +1,8 @@
 import { Router } from 'express';
 import { db, hydrateProduct } from '../db.js';
-import { upload, saveTileFace, saveThumb, removeUpload, nano } from '../storage.js';
+import {
+  upload, uploadBulk, saveTileFace, saveThumb, removeUpload, nano,
+} from '../storage.js';
 import { materialModel, solidSwatch, parseHex } from '../materials.js';
 import { requireAuth } from '../auth.js';
 
@@ -31,7 +33,10 @@ router.post('/product-categories', requireAuth, (req, res) => {
 router.get('/products', (req, res) => {
   const { category, surface, material, finish, q, sort = 'default', limit = 200, offset = 0 } = req.query;
   const where = ['active = 1'];
-  const params = { limit: Number(limit), offset: Number(offset) };
+  // A non-numeric limit or offset falls back to the defaults rather than
+  // failing the query.
+  const num = (v, d) => (Number.isFinite(Number(v)) ? Number(v) : d);
+  const params = { limit: num(limit, 200), offset: num(offset, 0) };
 
   if (category && category !== 'all') { where.push('category = @category'); params.category = category; }
   if (material) { where.push('material = @material'); params.material = material; }
@@ -215,7 +220,7 @@ router.delete('/products/:id', requireAuth, async (req, res, next) => {
  * Bulk upload: every image becomes its own single-face product, named after
  * the file. This is how a catalogue of a few hundred SKUs actually gets in.
  */
-router.post('/products/bulk', requireAuth, upload.array('images', 200), async (req, res, next) => {
+router.post('/products/bulk', requireAuth, uploadBulk.array('images', 200), async (req, res, next) => {
   try {
     const b = req.body ?? {};
     const created = [];

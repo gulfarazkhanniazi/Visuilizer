@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { db } from '../db.js';
 import {
   createUser, listUsers, userCount, verifyPassword, hashPassword,
-  createSession, destroySession, currentUser, requireAuth,
+  createSession, destroySession, currentUser, requireAuth, requireRole,
   throttle, clearThrottle,
 } from '../auth.js';
 
@@ -64,7 +64,9 @@ router.post('/auth/logout', (req, res) => {
 
 router.get('/auth/users', requireAuth, (req, res) => res.json(listUsers()));
 
-router.post('/auth/users', requireAuth, (req, res, next) => {
+// Creating or removing accounts is an administrator's job: an editor must not
+// be able to mint an admin account or delete one.
+router.post('/auth/users', requireRole('admin'), (req, res, next) => {
   try {
     const { email, password, name, role } = req.body ?? {};
     res.status(201).json(createUser({ email, password, name, role }));
@@ -87,7 +89,7 @@ router.post('/auth/password', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-router.delete('/auth/users/:id', requireAuth, (req, res) => {
+router.delete('/auth/users/:id', requireRole('admin'), (req, res) => {
   if (req.params.id === req.user.id) {
     return res.status(400).json({ error: 'You cannot delete the account you are signed in with' });
   }

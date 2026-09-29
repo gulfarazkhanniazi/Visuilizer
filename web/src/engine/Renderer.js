@@ -424,14 +424,17 @@ export default class Renderer {
     u.uMaterial.value = materialModelId(product?.material);
     u.uColor.value.fromArray(hexToRgb(state.color));
 
-    if (product) {
-      const entry = this.products.get(product.id);
-      if (entry) {
-        u.uTile.value = entry.texture;
-        // Only a modular material picks a different face per unit; a sheet, a
-        // rug or a coat of paint is one continuous thing.
-        u.uFaces.value = model === 'module' && state.randomFace ? entry.faces : 1;
-      }
+    // Each frame's material keeps its own texture, so it must be cleared when
+    // this frame has no product (or its product has not loaded yet).
+    // Otherwise the surface keeps drawing whatever product it had before, and
+    // after a compare swap, keep or reset one side shows the other's tiles
+    // instead of the original photo.
+    const entry = product ? this.products.get(product.id) : null;
+    u.uTile.value = entry ? entry.texture : null;
+    if (entry) {
+      // Only a modular material picks a different face per unit; a sheet, a
+      // rug or a coat of paint is one continuous thing.
+      u.uFaces.value = model === 'module' && state.randomFace ? entry.faces : 1;
     }
 
     u.uTileSize.value.set(state.tileSize.w / 1000, state.tileSize.h / 1000);

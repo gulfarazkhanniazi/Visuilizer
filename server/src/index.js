@@ -44,6 +44,15 @@ app.get(/^\/(?!api|uploads).*/, (req, res, next) => {
 
 app.use((err, req, res, next) => {
   console.error(err);
+  // An upload the limits rejected is the client's problem, not a server
+  // fault: too big is 413, anything else multer refuses is 400.
+  if (err.name === 'MulterError') {
+    return res.status(err.code === 'LIMIT_FILE_SIZE' ? 413 : 400).json({ error: err.message });
+  }
+  // Database errors carry table and column names; they stay in the log.
+  if (typeof err.code === 'string' && err.code.startsWith('SQLITE_')) {
+    return res.status(500).json({ error: 'Server error' });
+  }
   res.status(err.status || 500).json({ error: err.message || 'Server error' });
 });
 

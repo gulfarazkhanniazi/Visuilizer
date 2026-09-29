@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { db } from '../db.js';
 import { saveDataUrl, nano } from '../storage.js';
+import { rateLimit } from '../ratelimit.js';
 
 const router = Router();
 
@@ -9,7 +10,7 @@ const router = Router();
  * The payload is the full per-surface state, which is small; the preview image
  * is optional and only used for link previews and the admin list.
  */
-router.post('/share', async (req, res, next) => {
+router.post('/share', rateLimit({ max: 60, name: 'share links' }), async (req, res, next) => {
   try {
     const { payload, preview } = req.body ?? {};
     if (!payload) return res.status(400).json({ error: 'payload is required' });
