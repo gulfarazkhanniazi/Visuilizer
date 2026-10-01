@@ -97,6 +97,9 @@ export function assignPixels(ctx, built) {
         let near = -1;
         for (let k = 0; k < geo.length; k++) if (inExt[k] && (near < 0 || tHit[k] < tHit[near])) near = k;
         const err = (k) => Math.abs(tHit[k] - zObs) / Math.max(zObs, 1e-3);
+        // Below eye level and clearly in front of the plane: furniture the
+        // segmenter labelled wall (a sofa back), not the wall itself.
+        const inFront = (k) => d[1] < 0 && zObs < tHit[k] * (1 - ASSIGN.frontTolRel);
         // Among in-extent planes whose hit agrees with the observed depth,
         // the best-agreeing one; the plane the fit already gave this pixel
         // gets a small bonus, and near-equal agreement (at a corner line both
@@ -108,7 +111,7 @@ export function assignPixels(ctx, built) {
         for (let k = 0; k < geo.length; k++) {
           if (!inExt[k]) continue;
           const e = err(k);
-          if (e > ASSIGN.depthTolRel) continue;
+          if (e > ASSIGN.depthTolRel || inFront(k)) continue;
           const cost = e - (k === gl ? ASSIGN.labelBonus : 0);
           if (cost < pickCost - ASSIGN.tieRel
               || (Math.abs(cost - pickCost) <= ASSIGN.tieRel && tHit[k] < tHit[pick])) {
@@ -120,7 +123,7 @@ export function assignPixels(ctx, built) {
           // best-agreeing plane that is at least roughly in extent.
           let best = -1;
           for (let k = 0; k < geo.length; k++) {
-            if (!inLoose[k] || !(tHit[k] > 0.05)) continue;
+            if (!inLoose[k] || !(tHit[k] > 0.05) || inFront(k)) continue;
             if (best < 0 || err(k) < err(best)) best = k;
           }
           if (best >= 0 && err(best) <= ASSIGN.depthTolRelLoose) { pick = best; stats.looseDepth++; }

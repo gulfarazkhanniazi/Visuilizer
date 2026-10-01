@@ -60,12 +60,15 @@ export function buildWalls(ctx, ex) {
     walls.forEach((wl) => { for (const p of wl.pixels) label[p] = wl.index; });
     candidates = adjacentPairs(grid, label, walls).map(([i, j]) => evaluatePair(ctx, walls[i], walls[j], label));
     const mergeable = candidates
-      .filter((c) => c.rejected && c.evidence && c.normalAngle !== undefined && c.normalAngle < CORNERS.mergeWithoutCornerDeg)
+      .filter((c) => c.stacked || (c.rejected && c.evidence && c.normalAngle !== undefined && c.normalAngle < CORNERS.mergeWithoutCornerDeg))
       .sort((a, b) => a.score - b.score);
     if (!mergeable.length) break;
     // Only if one plane explains both: parallel planes a step apart (a
     // chimney breast) are two walls even when their corner is not proven.
+    // Parallel planes stacked one above the other are one wall regardless:
+    // no vertical line can separate them.
     const m = mergeable.find((c) => {
+      if (c.stacked) return true;
       const px = c.wallA.pixels.concat(c.wallB.pixels);
       const u = relResidual(W, px, fitVertical(W, px));
       return u <= PLANES.mergeResidualGain * Math.max(
@@ -317,6 +320,10 @@ function evaluatePair(ctx, A, B, label) {
     // intersection; the corner is where the boundary between their pixels is.
     const bnd = observedBoundary(ctx, A, B, label);
     if (!bnd) return reject(base, 'parallel planes with no shared boundary in the image');
+    const wrong = stepWrongSide(ctx.grid, A, B, bnd.u);
+    if (wrong > CORNERS.stepMaxWrongSide) {
+      return { ...reject(base, `parallel planes stacked one above the other (${(100 * wrong).toFixed(0)}% of their pixels on the wrong side of the step), not side by side`), stacked: true, normalAngle };
+    }
     xz = null;
     type = 'step';
     base.stepBoundaryU = bnd.u;
@@ -451,6 +458,34 @@ function sAtImageU(ctx, wl, u) {
   const tt = wl.plane.o / den;
   if (tt <= 0) return null;
   return wl.t[0] * d[0] * tt + wl.t[1] * d[2] * tt;
+}
+
+/**
+ * Share of A's and B's pixels on the wrong side of a vertical step line at
+ * image column u (A belongs left of it, B right), counted only in the rows the
+ * other wall also occupies, so a header running above a recess does not count.
+ */
+function stepWrongSide(grid, A, B, u) {
+  const { GW } = grid;
+  const ub = u / grid.sx;
+  const rows = (wl) => {
+    let y0 = Infinity; let y1 = -Infinity;
+    for (const p of wl.pixels) { const y = (p / GW) | 0; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+    return [y0, y1];
+  };
+  const [a0, a1] = rows(A); const [b0, b1] = rows(B);
+  let wrong = 0; let n = 0;
+  for (const p of B.pixels) {
+    const y = (p / GW) | 0;
+    if (y < a0 || y > a1) continue;
+    n++; if ((p % GW) + 0.5 < ub) wrong++;
+  }
+  for (const p of A.pixels) {
+    const y = (p / GW) | 0;
+    if (y < b0 || y > b1) continue;
+    n++; if ((p % GW) + 0.5 > ub) wrong++;
+  }
+  return n ? wrong / n : 0;
 }
 
 /** Mean image column of the boundary between A's and B's pixels. */

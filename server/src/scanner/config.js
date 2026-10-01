@@ -106,11 +106,19 @@ export const CORNERS = {
   // Adjacent walls whose corner candidate is rejected on evidence, and whose
   // planes are closer to parallel than this, are one wall split by noise.
   mergeWithoutCornerDeg: 20,
+  // A step between parallel planes is a vertical line with one wall on each
+  // side. When more than this share of the two walls' pixels (in the rows
+  // they share) lies on the wrong side of it, they are stacked one above the
+  // other -- one wall split horizontally by depth noise -- not a step.
+  stepMaxWrongSide: 0.4,
 };
 
 export const ASSIGN = {
   depthTolRel: 0.18,         // ray hit vs observed depth
   depthTolRelLoose: 0.35,
+  // A wall-labelled pixel below eye level whose observed depth is this far in
+  // front of the plane is furniture the segmenter missed (a sofa back).
+  frontTolRel: 0.12,
   labelBonus: 0.03,          // preference for the plane the fit assigned the pixel to
   tieRel: 0.004,             // depth agreements this close are a tie -> nearer hit
   flushTolRel: 0.015,        // an object this close to a wall's plane lies flush on it
